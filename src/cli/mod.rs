@@ -1325,6 +1325,21 @@ pub struct UpdateArgs {
     #[arg(long)]
     pub claim: bool,
 
+    /// Only apply this update if the issue has not changed since you read it
+    /// (GitHub #500).
+    ///
+    /// Pass the `updated_at` that `br show <id> --json` reported. If the
+    /// record has moved since, nothing is written and the command exits 6
+    /// naming both timestamps, so a caller can re-read and retry instead of
+    /// silently discarding the other writer's revision. Omitting the flag
+    /// keeps today's behaviour.
+    ///
+    /// This complements `--force`'s magnitude guard rather than duplicating
+    /// it: that one asks whether a value is destructive on its face, this one
+    /// asks whether the writer was looking at the current record.
+    #[arg(long, value_name = "UPDATED_AT")]
+    pub if_unchanged: Option<String>,
+
     /// Force update even if issue is blocked, and allow a destructive
     /// rewrite of a non-empty description/design/acceptance-criteria/prerequisites/
     /// notes/agent-context value: clearing it, or replacing it with content
@@ -3551,12 +3566,22 @@ pub struct DoctorMigrateSchemaArgs {
 /// Explicit schema-migration lifecycle.
 #[derive(Subcommand, Debug, Clone)]
 pub enum DoctorMigrateSchemaCommand {
+    /// Back up the complete family and recover engine read admission without changing schema.
+    Recover(DoctorMigrateSchemaRecoverArgs),
     /// Inspect the live database and emit a token bound to its exact file-family state.
     Plan(DoctorMigrateSchemaPlanArgs),
     /// Apply the reviewed migration only when the live state still matches a plan token.
     Apply(DoctorMigrateSchemaApplyArgs),
     /// Restore the exact pre-migration database family from a completed run.
     Undo(DoctorMigrateSchemaUndoArgs),
+}
+
+/// Arguments for `br doctor migrate-schema recover`.
+#[derive(Args, Debug, Clone, Default)]
+pub struct DoctorMigrateSchemaRecoverArgs {
+    /// Emit the machine-readable recovery receipt.
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// Arguments for `br doctor migrate-schema plan`.
@@ -3911,6 +3936,16 @@ mod tests {
 
     #[test]
     fn test_doctor_migrate_schema_lifecycle_parses() {
+        let recover = Cli::parse_from(["br", "doctor", "migrate-schema", "recover", "--json"]);
+        let Commands::Doctor(recover_args) = recover.command else {
+            panic!("expected doctor command");
+        };
+        assert!(matches!(
+            recover_args.subcommand,
+            Some(DoctorSubcommand::MigrateSchema(DoctorMigrateSchemaArgs {
+                command: DoctorMigrateSchemaCommand::Recover(recovery)
+            })) if recovery.json
+        ));
         let plan = Cli::parse_from(["br", "doctor", "migrate-schema", "plan", "--json"]);
         let Commands::Doctor(plan_args) = plan.command else {
             panic!("expected doctor command");

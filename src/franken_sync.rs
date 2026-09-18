@@ -185,6 +185,17 @@ impl std::fmt::Debug for Connection {
 }
 
 impl Connection {
+    /// Open an existing database only when its VFS handle matches the retained identity.
+    pub fn open_existing_with_expected_identity(
+        path: impl Into<String>,
+        identity: fsqlite_vfs::FileIdentity,
+    ) -> Result<Self, FrankenError> {
+        let inner = drive(fsqlite::Connection::open_existing_with_expected_identity(
+            path, identity,
+        ))?;
+        Self::from_inner(inner, true)
+    }
+
     /// Open (or create) a database at `path`.
     pub fn open(path: impl Into<String>) -> Result<Self, FrankenError> {
         let inner = drive(fsqlite::Connection::open(path))?;
@@ -287,6 +298,11 @@ impl Connection {
     /// Close in place, retaining the handle on error so callers can retry.
     pub fn close_in_place(&mut self) -> Result<(), FrankenError> {
         drive(self.inner.close_in_place())
+    }
+
+    /// Close without checkpointing; the caller controls checkpoint admission.
+    pub fn close_without_checkpoint_in_place(&mut self) -> Result<(), FrankenError> {
+        drive(self.inner.close_without_checkpoint_in_place())
     }
 }
 
@@ -408,6 +424,33 @@ mod tests {
             .query_row_with_params(&[SqliteValue::from("a")])
             .expect("query");
         assert_eq!(row.get(0).and_then(SqliteValue::as_integer), Some(1));
+    }
+
+    #[test]
+    fn engine_recovery_refuses_replaced_database_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("source.db");
+        let conn = Connection::open(path.to_string_lossy().into_owned()).unwrap();
+        conn.execute("CREATE TABLE original (value TEXT)").unwrap();
+        conn.close().unwrap();
+        let retained = std::fs::File::open(&path).unwrap();
+        let identity = fsqlite_vfs::FileIdentity::from_file(&retained)
+            .unwrap()
+            .unwrap();
+        std::fs::rename(&path, temp.path().join("retained-original.db")).unwrap();
+        std::fs::write(&path, b"replacement must not be opened").unwrap();
+        assert!(
+            Connection::open_existing_with_expected_identity(
+                path.to_string_lossy().into_owned(),
+                identity,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"replacement must not be opened"
+        );
+        assert!(retained.metadata().unwrap().len() > 0);
     }
 
     #[test]

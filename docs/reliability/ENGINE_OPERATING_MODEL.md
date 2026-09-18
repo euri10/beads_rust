@@ -1,6 +1,21 @@
 # Storage Engine Operating Model
 
-**Status:** reviewed 2026-09-08 (main and released br v0.5.11 pin fsqlite 0.3.18)
+**Status:** reviewed 2026-09-17. Post-0.4.4-cutover main uses the uniform
+published FrankenSQLite 0.4.4 family (all 20 consumed members at 0.4.4,
+commit `9d3d98778a372aba95d76d05c5c974ac0238c96a`), adopted per the
+`beads_rust-0edxa` upgrade. The prior mixed family (facade/core 0.4.2,
+pager 0.4.3, btree/vdbe 0.4.1, others 0.4.0) qualified under `beads_rust-otrgz`;
+0.4.4 additionally carries the native-WAL abandoned-page reclamation fix
+([`e21d008b4`](https://github.com/Dicklesworthstone/frankensqlite/commit/e21d008b4),
+bd-u2kmg) and the INSERT-conflict provisional-rowid cleanup
+([`725e31ee7`](https://github.com/Dicklesworthstone/frankensqlite/commit/725e31ee7),
+bd-55kh5) noted under §7's `beads_rust-f3r4` rowid-discard limitation.
+Asupersync stays exactly 0.5.0 across br, engine and FastMCP. Full 0.4.4
+qualification receipts (lib 3,092, model 172, linearizability 25, repro 164,
+schema-migration suite, all-target/all-features check, denied-warning clippy
+lib/bins+tests, MCP 22+1, retained-family stress 8×60/8×90) live in
+`UPGRADE_LOG.md` under `beads_rust-0edxa` — the upgrade is complete.
+
 **Owner bead:** `beads_rust-dk45` (Track B of the 2026-09-01 bridge plan)
 
 This document is the record of how `br` relates to its storage engine, what
@@ -54,16 +69,59 @@ Implemented in `src/sync/mod.rs` (`DatabaseOpenerLease`) and
   the exit-time TRUNCATE (`SqliteStorage::drop`, only when the handle made
   mutations, #270) first **upgrade to the exclusive hold** and are **skipped
   when another process has the database open** (`CheckpointAdmission::PeersPresent`).
-- New openers wait out an in-flight exclusive hold, so no process starts
-  reading a WAL that is being reset.
-- The lease is advisory. It degrades to "checkpoints disabled", never to a
-  blocked command. Read-only commands leave `mutation_count` at zero and never
-  checkpoint on teardown.
+- New openers wait out an in-flight exclusive hold and refuse admission after
+  five seconds; they never proceed without registration.
+- A sibling `.br-db-openers-<hash>.transition.lock` serializes upgrades before
+  the contender releases its shared registration. A losing contender keeps
+  its shared hold, so concurrent upgrades cannot overlook each other.
+- The typed exclusive hold restores shared protection on drop. If restoration
+  fails, the lease retains the transition barrier until engine teardown,
+  preventing other checkpoint attempts from overlooking the live handle.
+  Read-only commands leave `mutation_count` at zero and never checkpoint on
+  teardown. Index repair retains exclusive admission through checkpoint,
+  REINDEX, connection close and any failure restore. Doctor's oversized-WAL
+  truncation also requires sole-opener admission. Partial REINDEX and the
+  rollback-only post-repair write probe retain shared opener registration
+  and use non-checkpointing connection close. They must successfully disable
+  `wal_autocheckpoint` before running SQL: a large REINDEX can otherwise
+  trigger an engine checkpoint during commit while peers still hold leases.
 
 Consequence for operators: under a busy swarm the WAL can grow because
 checkpoints are skipped while peers are present; `br doctor` reports `wal_size`
 and the sole-opener state (`beads_rust-dk45.5` adds an `engine` block with the
 lease holder).
+
+### Missing shared WAL index at startup
+
+Ordinary startup can reconstruct a missing `-shm` index for an existing WAL
+family before inspecting pending sync-merge metadata. It holds database-family
+write authority and an exclusive opener lease, retains a complete backup, and
+rehearses recovery on a private copy. The automatic path validates every physical
+WAL frame, including salts, checksums, page sizes and complete frame boundaries.
+It refuses damaged or ambiguous tails rather than accepting only a valid prefix.
+Checksums establish internal consistency; they cannot prove that an otherwise
+valid foreign WAL belongs to this database.
+
+Recovery must preserve the main database, WAL and rollback journal bytes and
+produce the same logical state as the private rehearsal. Startup then inspects
+the actual recovered pending-merge receipt; it never treats unavailable metadata
+as absent or reconstructs these committed rows from JSONL. A live peer prevents
+this recovery. Explicit read-only fast opens (`--no-auto-import --no-auto-flush`),
+observational sync modes (`--status`, `--reconcile --dry-run`), and diagnostic
+doctor commands do not enter the automatic repair path. Recovery
+receipts and original bytes remain under `.br_recovery/schema-migrations/`.
+
+Read-only inspection of a missing-index family uses a private snapshot. It
+retains the original opener lease, copies the complete family through retained
+no-follow descriptors, and checks source identities, metadata and full content
+hashes before and after recovery. The private WAL passes the same strict
+validation, private recovery must preserve main/WAL/journal bytes, and integrity
+must pass before returning a read handle. The live shared index remains absent;
+changed or unsafe source files cause refusal. Original namespace sidecars must
+still satisfy the engine's ownership and single-link rules; copying must not
+hide unsafe source topology. This permits doctor and
+observational sync to inspect committed rows and pending receipts without
+repairing the live family.
 
 ## 4. Database family and sidecar inventory
 
@@ -78,7 +136,7 @@ the suffix lists; `doctor`'s family walk reads the same constants):
 | `beads.db-wal-cert`, `-wal-cert-head` | engine (0.2+) | parallel-WAL durability certificates | derived state; a certificate written by a different engine generation makes every cert-regenerating write fail while reads stay healthy (GH #441); br quarantines it into `.br_recovery/` so the engine regenerates it |
 | `beads.db-fsqlite-ns-gate`, `-fsqlite-ns-use` | engine (0.1.18+) | multi-process namespace admission | `db.namespace_identity` compares the recorded generation with the main file before any live engine open; distinguishes a mismatch from unavailable evidence and absent sidecars. `permissions.db_sidecars` flags group/other exposure beyond what the linked engine admits; namespace identity diagnosis preserves the files and offers no namespace fixer |
 | `beads.db.fsqlite-migration-state` | engine | migration bookkeeping | carried with the family |
-| `.br-db-write-<hash>.lock`, `.br-db-openers-<hash>.lock` | br | write authority and opener lease | `write_lock`, engine block |
+| `.br-db-write-<hash>.lock`, `.br-db-openers-<hash>.lock`, `.br-db-openers-<hash>.transition.lock` | br | write authority, opener registration and serialized checkpoint admission | `write_lock`, engine block |
 | `.br_recovery/` | br | forensic backups taken before recovery rebuilds (whole family) | `db.recovery_artifacts` (info), `db.recovery_artifacts.aged` (warn past `RECOVERY_AGED_TTL_DAYS = 30`), `db.foreign_recovery_debris` |
 | `.br_history/` | br | bounded JSONL snapshots (`br history`) | `br_history.size` |
 
@@ -148,6 +206,7 @@ A release without these receipts is not a release.
 
 | Bead | Symptom in br | Upstream |
 |---|---|---|
+| `beads_rust-otrgz`, `beads_rust-nx2sh` (published engine fix adopted) | Concurrent CLI reads could make MCP startup's authority-bound pending-sync inspection fail with database busy before FastMCP dispatch. The same-current-source startup probe failed 10/20 rounds on 0.4.0 and passed 20/20 with the published fix. | The read-only WAL bootstrap formerly requested exclusive maintenance while adopting an existing WAL locally. The [`683a241b` fix](https://github.com/Dicklesworthstone/frankensqlite/commit/683a241bc3830a500bfcb8f9e5380e57fdebcf9c) uses local mode adoption and shared-snapshot validation; published facade/core 0.4.2 and pager 0.4.3 carry it. Qualification passed 3,161 library cases, all 22 MCP protocol cases, 25 multiprocess linearizability cases and 172 model-based cases, plus both real-family stress gates and the full concurrency/replay targets. Exact inputs, ignores and receipts are in `UPGRADE_LOG.md`; these passes do not replace release qualification. |
 | `beads_rust-ro3m` (engine fix verified) | Grouped/HAVING IN-subquery counts returned NULL with bound parameters and trailing predicates on 0.3.15/0.3.16. All four original `grouped_having_in_subquery_count_with_bound_params` variants pass on 0.3.18 (2026-09-07); the probe is now a normal regression test and the multi-label AND count detour is removed. `multi_label_and_count_matches_list` guards the public result. | [frankensqlite#407](https://github.com/Dicklesworthstone/frankensqlite/issues/407), fixed after the v0.3.16 tag; the pinned 0.3.18 release carries the correction |
 | `beads_rust-f3r4` | B-tree rowid-order corruption after 264 sequential dep-remove writes (GH #426) | not filed: the #426 sequence passes on fsqlite 0.3.15; `gh426_sequential_dependency_removals_keep_projections_and_integrity` (tests/model_based_storage.rs) guards it |
 | `beads_rust-ajui` | migrate-schema 16→17 reports success but leaves the DB failing `integrity_check` (GH #428) | not filed: br-side fix landed (migration requires a clean fresh-connection integrity witness, `doctor_subsystems/schema_migration.rs`; `tests/e2e_schema_migration_upgrade.rs`); bead closed |

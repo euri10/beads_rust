@@ -1,5 +1,267 @@
 # Changelog research — 2026-09-08
 
+## 2026-09-16 — published engine startup fix and final concurrency proofs
+
+The qualified registry-only lock changes exactly five package records:
+fsqlite/core 0.4.2, pager 0.4.3, btree/vdbe 0.4.1. Other family members remain
+0.4.0 and Asupersync remains 0.5.0. Lock SHA-256:
+`665f9fd7ca001beb2bf2f047572ceb4268914feb4904f12ab2990ee66884276a`.
+Full archive-source comparisons link facade/pager to upstream `78134a656`
+and core/btree/vdbe to `50972bf7c`. The core WAL adapter and vacuum source
+match the previously isolated `683a241b` fix. This establishes publication
+provenance, not runtime correctness by itself. Published vdbe 0.4.1 does not
+include upstream's later `725e31ee7` discarded-rowid fix.
+
+Current application source `a42db752` with these engine records passed
+all-target/all-feature check and denied-warning Clippy, 3,161 library cases
+(nine existing ignores), 22 MCP protocol cases, one shutdown case, 25
+linearizability cases, 192 concurrency cases, 166 observational-open cases
+(one existing ignore), 167 recovery replay cases and all 172 model cases.
+The model suite includes all 120 generated sequences and the historical
+300-issue/264-removal regression. The final model/concurrency/startup-benchmark
+batch used overlay `2c7712a4367795eed49ea21eb11f480f8373d95bf73ae8c4d3ce1154f477ba79`.
+Counts include shared test helpers and are not unique product scenarios.
+Logs and real-family 8×60/8×90 stress receipts are indexed in `UPGRADE_LOG.md`.
+Twenty startup-race rounds passed, versus ten failures in the twenty-round
+0.4.0 comparison. The pins are adopted; no new release is claimed here.
+
+The retained original-engine Windows executable separately passed three
+workspace-waiter and five opener-lease tests through a natively compiled RCH
+launcher. This is not evidence for the newer engine or a current CLI lifecycle.
+The new replenishing-writer test records 57 real calls, their live registrations
+and exact durable comment order; its passing result establishes observed bounded
+progress, not strict arrival-time FIFO or universal scheduler liveness.
+
+## 2026-09-15 — missing WAL shared-index startup recovery
+
+Workstream `beads_rust-otrgz.2` addresses the three unchanged workspace replay
+failures documented in `UPGRADE_LOG.md`. `db088c21` adds strict automatic-recovery
+WAL validation; `868d658d` connects the existing backed-up, privately rehearsed
+recovery to startup before the pending-merge inspection. Follow-up changes
+preserve explicit read-only and observational sync contracts. Six focused CLI
+tests passed through RCH, including WAL-only committed data and a legacy pending
+receipt that must still block writes. Subsequent all-target/all-feature compiler
+and denied-warning Clippy checks passed. No release or parent engine-workstream
+completion is claimed.
+
+The initial focused run failed its fixture oracle because explicit engine close
+checkpointed the sentinel. Setup now uses the facade's non-checkpointing drop;
+the assertion that the sentinel is absent from main and present in WAL remains.
+The broader first run failed six fixture lookups because cached RCH binaries
+referenced removed temporary source trees. Exact tracked fixture restoration
+and a rerun are required; those failures are not counted as successful tests.
+
+The added valid-current-receipt unit case then failed the same main-absence
+oracle for a different reason: `SqliteStorage::drop` skipped its TRUNCATE for
+peers but called `close_in_place`, whose engine implementation runs a passive
+checkpoint. The fix uses `close_without_checkpoint_in_place` after the existing
+admitted checkpoint. Both validator unit tests passed in that run; the valid
+receipt test subsequently passed with whole-main equality against the
+receipt-free baseline and exact recovered receipt equality. The original
+contiguous-byte receipt search was invalid because a serialized receipt can
+span WAL frames; that fixture oracle correction is recorded in `68bdc0b8`.
+
+The next broad run passed 4,457 target cases and failed three. Doctor still
+could not inspect missing-SHM families through its live read-only engine path.
+A private snapshot fallback restored positive reads without live repair; all
+167 unchanged workspace replay and 172 migration cases then passed, along with
+CRUD, export atomicity, invariants and sync reconciliation. One health fixture
+needed an explicit checkpoint for its raw header mutation; its original
+assertions remain. The separate live-peer lifecycle failure also reproduces
+on pre-change revision `b41234d0`, with all 1,156 tracked build inputs verified
+against that revision; it remains an open engine blocker. Final snapshot
+admission checks reject foreign-owned or
+multiply linked namespace sources before copying; their final verification
+is tracked in `UPGRADE_LOG.md`. Retained failed runs are not counted as passes.
+
+Follow-up review found that opener registration formerly proceeded without a
+lease after five seconds, and competing upgrades could drop both shared
+registrations. Registration now fails closed; an additional transition lock
+serializes upgrades and remains held if shared restoration fails. Doctor index
+repair also retains sole-opener admission through connection teardown and
+rollback. All-target/all-feature check and Clippy pass; runtime qualification
+of these additions remains pending. The sync filesystem witness now recognizes
+only the exact new transition-lock filename shape; JSONL publication's runtime
+path allowlist is unchanged.
+
+The final debug qualification on overlay `16a69c65` passed 4,047 target cases
+and failed one filesystem-inventory assertion, with ten existing ignores.
+The library contributed 3,160 passes; doctor chokepoint 186, unchanged replay
+167, migration 172, reconciliation 189, and sync Git safety 173. Counts include
+repeated harness cases. The failed inventory omitted the existing
+`beads.db.fsqlite-migration-state` engine-family member; its exact suffix was
+added without changing runtime JSONL publication permissions. Further raw-close
+review added shared registration and non-checkpointing close to partial REINDEX
+and the rollback-only write probe, and sole-opener admission to explicit WAL
+truncation. A committed-WAL regression covers these paths. All-target/all-feature
+check and Clippy pass on overlay `b8bb3b02`; final release-mode execution remains
+pending. Current Windows-worker SSH probes timed out before authentication.
+
+That release run subsequently passed all nine targets: 4,618 target cases,
+zero failures and ten existing ignores, qualifying and closing `otrgz.2`.
+Log: `/tmp/br-otrgz-release-runtime-pre-auto.log`. A separate source review
+then found raw REINDEX's commit-time automatic checkpoint, so this result is
+not evidence for the final doctor patch. `8785215b` explicitly disables
+automatic checkpoints; `af2bd3f0` expands the real fixture beyond the engine's
+4,000-frame urgent threshold. The new case and all 3,161 library cases pass
+(nine existing ignores) on overlay `5f43c9a3`, with all-target/all-feature check
+and Clippy passing as well. Log: `/tmp/br-otrgz-autocheckpoint-runtime.log`.
+Final release doctor CLI qualification also passed: 186 tests, zero failures,
+one existing ignore on the same `5f43c9a3` overlay, closing `otrgz.3`.
+Log: `/tmp/br-otrgz-autocheckpoint-release-runtime.log`. Verification is root
+re-execution; collaborator review is source evidence, not independent runtime
+verification. No engine-parent closure or release publication is claimed.
+
+## 2026-09-15 — CLI patch maintenance
+
+Commits `3d0eb2dd` and `ae5b95bd` update clap/builder/derive to 4.6.7 and
+clap_complete to 4.6.11. The final lockfile changes exactly those four package
+records; engine, runtime and feature selections remain unchanged. Upstream
+clap's deferred initialization is not enabled. Completion 4.6.11's static Zsh
+escaping fix is outside br's dynamic registration path, so the changelog does
+not claim a new escaping behavior in br. Exact upstream revisions, separate
+dependency gates and final qualification results are recorded in `UPGRADE_LOG.md`.
+
+## 2026-09-15 — isolated engine qualification
+
+The current br source with the isolated upstream `683a241b` engine candidate
+passed 3,561 test invocations through RCH: 3,151 library cases (nine existing
+ignores), 191 concurrency cases, all 22 MCP protocol cases, 25 multiprocess
+linearizability cases and 172 model-based cases. The latter includes all 120
+generated sequences and the full historical 300-issue/264-removal regression.
+No tests, timeouts or assertions changed. All three MCP startup failures on
+the published 0.4.0 engine passed on this candidate, with FastMCP 0.10.0 and
+Rustls 0.23.45 fixed. Exact source receipt and logs are in `UPGRADE_LOG.md`.
+The same-current-source standalone startup probe then passed 10/20 rounds on
+main's engine and 20/20 on the candidate. All baseline failures were the same
+pre-dispatch database-busy refusal; every concurrent CLI observer succeeded.
+Both eight-worker real-family stress gates also passed: 160 acknowledged
+commands over 60 seconds and 244 over 90 seconds. All 75 nonzero outcomes
+were expected validation refusals; integrity, database/JSONL equality, doctor
+and recovery-artifact checks passed on both complete private copies.
+
+This is experimental qualification evidence, not an adopted dependency update
+or a release. Main's manifest and lockfile remain unchanged. The fix still
+needs an aligned published engine family and qualification on the final pins;
+`beads_rust-otrgz` and dependent `beads_rust-nx2sh` remain open.
+
+## 2026-09-15 — published MCP dependencies and TLS patch
+
+The FastMCP change at
+[806819f9](https://github.com/Dicklesworthstone/beads_rust/commit/806819f9)
+replaces eight Git-source 0.9.0 crates with published 0.10.0 packages and their
+required `dirs` 7.0.0 dependency. Exact prior Git revision and upstream tag
+research are recorded in `UPGRADE_LOG.md`; br's existing Asupersync 0.5.0 pin
+already matches the new release. Package inspection exposed local evidence
+archives in Cargo's file set. Excluding `tests/artifacts/` shrank the package
+from 96.2 MiB to 3.1 MiB without deleting evidence or excluding source inputs.
+
+RCH compiler and Clippy checks passed, as did 3,151 library cases (nine existing
+ignores), the shutdown test and ten manifest tests. MCP protocol results were
+19 passing and three failing startup database-admission cases, before FastMCP
+dispatch. These failures remain a qualification gate; no test was weakened.
+
+The fresh advisory audit identified Rustls 0.23.43 as affected by
+[RUSTSEC-2026-0285](https://rustsec.org/advisories/RUSTSEC-2026-0285.html).
+Upstream [0.23.45](https://github.com/rustls/rustls/releases/tag/v/0.23.45)
+fits all eight reverse-dependency constraints without engine/runtime upgrades.
+The separate Rustls-only lock update clears the advisory audit. RCH compiler
+and Clippy checks passed, followed by 3,151 library cases (nine existing
+ignores), the shutdown test and ten package-manifest tests in the normal test
+profile. Source overlay:
+`3df607525f75f553a75aa3d8ae1848a0a1d0e7dc1e46d7e1d532f13660ad9689`.
+Neither change is a published br release. The startup failures remain open;
+full evidence and outstanding work remain in `UPGRADE_LOG.md`.
+
+## 2026-09-15 — explicit engine admission recovery
+
+The retained schema-17 family failed read-only admission because its legacy
+SHM header had a zero page size. The September 14 private probe established
+that the engine's existing-only writable open repairs SHM while preserving
+main/WAL/journal bytes and all 1,086 issue rows; subsequent schema migration
+and both real-family stress gates passed on the experimental engine candidate.
+See `UPGRADE_LOG.md` for the evidence and remaining release gates.
+
+The new `doctor migrate-schema recover` exposes that operation with complete
+engine-family backup, private rehearsal, sole-opener admission, retained VFS
+identity binding, protected-file byte checks, and a full logical comparison.
+Initial implementation commits:
+[e4c772af](https://github.com/Dicklesworthstone/beads_rust/commit/e4c772af)
+and [eaadcbe0](https://github.com/Dicklesworthstone/beads_rust/commit/eaadcbe0).
+Validation completed under `beads_rust-otrgz.1`: RCH all-target/all-feature
+compiler and denied-warning Clippy checks passed. Release/all-feature testing
+passed 3,151 library tests (nine existing ignores) and all 165 schema-migration
+end-to-end tests. The final source overlay fingerprint is
+`0cd8eac713e217ced6b10cae21894d967cec64f13ed39afab36bf16fceeb41fe`.
+The actual CLI then recovered a complete private copy of the retained family:
+planning changed from `BusyRecovery` to eligible, all 1,086 issues remained,
+and the original snapshot's bytes and filesystem identity remained unchanged.
+Logs: `/tmp/br-otrgz1-{check,clippy,final-tests,cli-canary}.log`.
+Formatting, diff checks and changelog structural validation passed. UBS exited
+1 on whole-file findings; reviewed critical reports concern test assertions,
+an existing filename nonce and non-secret witness comparisons, not a clean
+scanner result. This is unreleased and does not qualify the dependency
+candidate or change version pins.
+
+## 2026-09-14 — routed-claim regression and engine follow-up
+
+`beads_rust-ls72r` is now reproduced: a routed claim exits 4 for an explicitly
+deferred external issue but changes the earlier local issue from `open` to
+`in_progress`. The incoming `bb51b8a4` change narrowed lifecycle preflight to
+closed issues. Restoring `SqliteStorage::validate_claim_target` during route
+preparation catches deferred status and future deferral dates before any route
+writes, while retaining the closed-claim refusal. Existing regression coverage
+checks both route orders, `--force`, exports, labels and audit events.
+Original runtime evidence: `/tmp/br-ls72r-claim-canary.log`. The full routing
+target passed 216 tests first on the isolated engine candidate, then 216 tests
+on the unchanged project dependency pins. The explicit-deferred runtime canary
+now exits 4 with both issues unchanged (`open`, `deferred`). Evidence:
+`/tmp/br-ls72r-pinned-routing-tests.log` and `/tmp/br-ls72r-fixed-canary.log`;
+pinned-source overlay:
+`baa3371c4d5db5224ff384e54a6e950a79f5effa365b31b5a274b75de4c6fb59`.
+All-target/all-feature compiler and Clippy checks passed through RCH with
+warnings denied (`/tmp/br-ls72r-final-checks.log`); formatting and diff checks
+passed. This is unreleased work.
+
+The isolated engine follow-up at upstream `683a241b` passes all 25 concurrency
+tests but still fails the retained real-family migration preflight. The SHM
+header has `is_init=1` and `sz_page=0`, which engine validation rejects before
+the new empty-WAL reader handling. Main dependency pins remain unchanged;
+see `UPGRADE_LOG.md` for source hashes, receipts and remaining qualification.
+
+## 2026-09-13 — migration marker and concurrency qualification
+
+`beads_rust-c2klf` adds `.fsqlite-migration-state` to the central config
+database-family inventory. Doctor and temporary-database cleanup already had
+explicit handling; config snapshot, recovery and orphan paths omitted it.
+Cleanup now uses the central inventory without its duplicate append. Tests
+cover marker bytes in snapshots, original-marker restoration after a failed
+replacement, orphan quarantine, symlink refusal and existing complete cleanup.
+Through RCH on the original 0.4.0 dependency set, all six targeted release-mode
+tests passed, followed by all 209 configuration tests with no failures or
+ignores. Source and manifest/lockfile hashes matched the controller checkout.
+Evidence: `/tmp/br-c2klf-{targeted-tests,config-tests}.log`, overlay
+`a83f7b923259ec94614d42e1d5d7ca19fdce7920c915c34e81832fe464f713f2`.
+All-target/all-feature compiler and Clippy checks passed through RCH with
+warnings denied; formatting and diff checks passed. Evidence:
+`/tmp/br-c2klf-{check,clippy}.log`. This is unreleased work.
+
+`beads_rust-otrgz` records a separate real concurrency failure on FrankenSQLite
+0.4.0: nine operations in the eight-process/30-second gate and 18 in isolation,
+both below its unchanged minimum of 100. Syscall traces retained under
+`/tmp/br-otrgz-strace/` show a shared-to-exclusive maintenance lock cycle during
+read-only opens. Published 0.4.1 fixes constructor WAL adoption. An isolated
+candidate passed the original gate with 305 operations and no failed calls;
+the full target then passed all 25 tests, including its planted-liar negative
+control, with 304 operations and no failed calls. Evidence:
+`/tmp/br-otrgz-published-041-{concurrency,full-concurrency}.log`.
+
+Only `fsqlite`, `fsqlite-core` and `fsqlite-pager` have published 0.4.1 packages;
+the remaining engine packages are 0.4.0. Main retains its original dependency
+pins. This mixed-version experiment is not a completed engine upgrade or
+release qualification. See `UPGRADE_LOG.md` for upstream commits and remaining
+gates. No new release or replacement of v0.6.0 assets is claimed.
+
 ## 2026-09-12 — unreleased JSONL exchange guard (qualification in progress)
 
 `beads_rust-og86t` addresses the separate export failure reproduced in

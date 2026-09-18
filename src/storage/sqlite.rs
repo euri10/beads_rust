@@ -22,7 +22,7 @@ use crate::sync::{
 };
 use crate::util::id::{normalize_prefix, parse_id};
 use crate::validation::{CommentValidator, ISSUE_LABEL_MAX_COUNT, IssueValidator, LabelValidator};
-use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, SecondsFormat, TimeZone, Utc};
 use fsqlite_error::FrankenError;
 use fsqlite_types::SqliteValue;
 use sha2::{Digest, Sha256};
@@ -1418,6 +1418,8 @@ pub struct SqliteStorage {
     /// cleanup the files accumulate in `TMPDIR` (#299). `None` for persistent
     /// databases, which must never be deleted on drop.
     temp_db_path: Option<PathBuf>,
+    /// Private recovered read snapshot; outlives the connection's teardown.
+    read_snapshot_dir: Option<tempfile::TempDir>,
     /// Tier 1 attribution to stamp onto the audit events of the NEXT mutation
     /// (issue #312, Layer 3 capture-only). Set via
     /// [`SqliteStorage::set_pending_event_attribution`] immediately before a
@@ -1451,7 +1453,7 @@ enum CheckpointAdmission {
     /// This process is the only opener; the exclusive opener hold (if the
     /// database is persistent) must be returned through
     /// [`SqliteStorage::release_checkpoint_admission`].
-    Sole(Option<std::fs::File>),
+    Sole(Option<crate::sync::DatabaseOpenerExclusiveHold>),
     /// Another process has the database open; no checkpoint may run.
     PeersPresent,
 }
@@ -2500,6 +2502,7 @@ impl SqliteStorage {
             write_authority: None,
             mutation_count: 0,
             temp_db_path: None,
+            read_snapshot_dir: None,
             pending_event_attribution: None,
             opener_lease,
             workflow_capacity_policy: crate::close_policy::CapacityPolicy::default(),
@@ -2570,6 +2573,10 @@ impl SqliteStorage {
     }
 
     pub(crate) fn open_current_read_only(path: &Path) -> Result<Option<Self>> {
+        Self::open_current_read_only_inner(path, true)
+    }
+
+    fn open_current_read_only_inner(path: &Path, allow_snapshot: bool) -> Result<Option<Self>> {
         let current_schema_version = u32::try_from(CURRENT_SCHEMA_VERSION).unwrap_or(0);
         // Cheap header pre-filter: only reject when the file is definitively not
         // a SQLite database (no valid header magic). A low header *version* must
@@ -2588,6 +2595,9 @@ impl SqliteStorage {
             return Ok(None);
         }
         let opener_lease = Some(crate::sync::DatabaseOpenerLease::register(path)?);
+        if allow_snapshot && missing_read_only_wal_index(path)? {
+            return Self::open_private_wal_snapshot(path, opener_lease);
+        }
         // The mode preflight above only sees group/other bits. A sidecar the
         // engine refuses for another reason — foreign owner, extra hard link
         // — surfaces here as a bare `CannotOpen`, and this lane is the first
@@ -2608,12 +2618,59 @@ impl SqliteStorage {
             write_authority: None,
             mutation_count: 0,
             temp_db_path: None,
+            read_snapshot_dir: None,
             pending_event_attribution: None,
             opener_lease,
             workflow_capacity_policy: crate::close_policy::CapacityPolicy::default(),
             workflow_transition_policy: crate::close_policy::Workflow::default(),
             last_capacity_warnings: Vec::new(),
         }))
+    }
+
+    fn open_private_wal_snapshot(
+        path: &Path,
+        source_lease: Option<crate::sync::DatabaseOpenerLease>,
+    ) -> Result<Option<Self>> {
+        let directory = tempfile::tempdir()?;
+        let copy_path = directory.path().join("snapshot.db");
+        let mut family = capture_read_snapshot_family(path)?;
+        for member in &mut family {
+            member.copy_to(&copy_path)?;
+        }
+        verify_read_snapshot_family(&mut family)?;
+        if !missing_read_only_wal_index(&copy_path)? {
+            return Err(BeadsError::SyncConflict {
+                message: "WAL index topology changed during private snapshot capture".to_string(),
+            });
+        }
+        validate_wal_for_index_recovery(&copy_path)?;
+        let mut recovery = Connection::open(copy_path.to_string_lossy().into_owned())?;
+        recovery.close_without_checkpoint_in_place()?;
+        drop(recovery);
+        // Engine recovery may rebuild private indexes, but may not discard WAL
+        // frames, checkpoint main, or replay a journal before our read verdict.
+        for member in &family {
+            if matches!(member.suffix, "" | "-wal" | "-journal") {
+                member.verify_copy(&copy_path)?;
+            }
+        }
+        let mut storage = Self::open_current_read_only_inner(&copy_path, false)?;
+        if let Some(storage) = storage.as_ref() {
+            let integrity = storage.conn.query("PRAGMA integrity_check")?;
+            if integrity.len() != 1
+                || integrity[0].get(0).and_then(SqliteValue::as_text) != Some("ok")
+            {
+                return Err(BeadsError::SyncConflict {
+                    message: "Private WAL snapshot failed integrity validation".to_string(),
+                });
+            }
+        }
+        verify_read_snapshot_family(&mut family)?;
+        if let Some(storage) = storage.as_mut() {
+            storage.opener_lease = source_lease;
+            storage.read_snapshot_dir = Some(directory);
+        }
+        Ok(storage)
     }
 
     pub(crate) fn fast_open_runtime_schema_is_compatible(&self) -> bool {
@@ -2680,6 +2737,7 @@ impl SqliteStorage {
             write_authority: None,
             mutation_count: 0,
             temp_db_path: None,
+            read_snapshot_dir: None,
             pending_event_attribution: None,
             opener_lease,
             workflow_capacity_policy: crate::close_policy::CapacityPolicy::default(),
@@ -2751,6 +2809,7 @@ impl SqliteStorage {
             write_authority: None,
             mutation_count: 0,
             temp_db_path: Some(path.to_path_buf()),
+            read_snapshot_dir: None,
             pending_event_attribution: None,
             opener_lease: None,
             workflow_capacity_policy: crate::close_policy::CapacityPolicy::default(),
@@ -3782,9 +3841,14 @@ impl SqliteStorage {
 
     /// Hand back the exclusive opener hold taken by [`Self::admit_checkpoint`]
     /// and rejoin the shared opener registration.
-    fn release_checkpoint_admission(&mut self, hold: Option<std::fs::File>) {
-        if let (Some(lease), Some(hold)) = (self.opener_lease.as_mut(), hold) {
-            lease.release_exclusive(hold);
+    fn release_checkpoint_admission(
+        &mut self,
+        hold: Option<crate::sync::DatabaseOpenerExclusiveHold>,
+    ) {
+        if let (Some(lease), Some(hold)) = (self.opener_lease.as_mut(), hold)
+            && let Err(error) = lease.release_exclusive(hold)
+        {
+            tracing::warn!(%error, "Checkpoint complete; retaining opener transition barrier until storage closes");
         }
     }
 
@@ -7432,6 +7496,22 @@ impl SqliteStorage {
             return Err(BeadsError::Validation {
                 field: "issue_id".to_string(),
                 reason: format!("cannot update tombstone issue: {id}"),
+            });
+        }
+
+        // Optimistic-concurrency precondition (GitHub #500). Compared as
+        // instants rather than strings so a caller may hand back the
+        // timestamp in any equivalent RFC 3339 spelling, and inside the write
+        // transaction so the answer cannot go stale between check and write.
+        if let Some(expected) = updates.expect_updated_at
+            && issue.updated_at != expected
+        {
+            return Err(BeadsError::UpdatePreconditionFailed {
+                id: id.to_string(),
+                expected: expected.to_rfc3339_opts(SecondsFormat::AutoSi, true),
+                actual: issue
+                    .updated_at
+                    .to_rfc3339_opts(SecondsFormat::AutoSi, true),
             });
         }
 
@@ -16599,9 +16679,6 @@ fn remove_temp_db_files(path: &Path) {
         for &suffix in crate::config::db_sidecar_suffixes() {
             targets.push(path.with_file_name(format!("{name}{suffix}")));
         }
-        // The migration-state sidecar is `.`-separated and is not part of
-        // `db_sidecar_suffixes()`, so append it explicitly.
-        targets.push(path.with_file_name(format!("{name}.fsqlite-migration-state")));
     }
     for target in targets {
         match std::fs::remove_file(&target) {
@@ -16962,6 +17039,180 @@ fn future_schema_error(version: u32, current_schema_version: u32) -> BeadsError 
     ))
 }
 
+/// Retained source and content witness for one private read-snapshot component.
+#[derive(Debug)]
+struct ReadSnapshotMember {
+    path: PathBuf,
+    suffix: &'static str,
+    source: Option<StableSchemaSource>,
+    metadata: Option<std::fs::Metadata>,
+    digest: Option<[u8; 32]>,
+}
+
+fn snapshot_digest(file: &mut std::fs::File) -> Result<[u8; 32]> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut hash = Sha256::new();
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hash.update(&buffer[..read]);
+    }
+    Ok(hash.finalize().into())
+}
+
+fn snapshot_metadata_matches(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
+    let same = before.len() == after.len()
+        && before.permissions() == after.permissions()
+        && before.modified().ok() == after.modified().ok();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        same && before.ctime() == after.ctime() && before.ctime_nsec() == after.ctime_nsec()
+    }
+    #[cfg(not(unix))]
+    {
+        same
+    }
+}
+
+impl ReadSnapshotMember {
+    fn verify_source(&mut self) -> Result<()> {
+        if let Some(source) = self.source.as_mut() {
+            source.verify_path(&self.path, "read snapshot component")?;
+            if self.metadata.as_ref().is_none_or(|before| {
+                source
+                    .file
+                    .metadata()
+                    .map_or(true, |after| !snapshot_metadata_matches(before, &after))
+            }) || Some(snapshot_digest(&mut source.file)?) != self.digest
+            {
+                return Err(BeadsError::SyncConflict {
+                    message: format!(
+                        "Database family changed during read snapshot: {}",
+                        self.path.display()
+                    ),
+                });
+            }
+            source.verify_path(&self.path, "read snapshot component")?;
+        } else if StableSchemaSource::open_optional(&self.path, "read snapshot component")?
+            .is_some()
+        {
+            return Err(BeadsError::SyncConflict {
+                message: format!(
+                    "Database family component appeared during read snapshot: {}",
+                    self.path.display()
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn copy_to(&mut self, db_path: &Path) -> Result<()> {
+        let Some(source) = self.source.as_mut() else {
+            return Ok(());
+        };
+        let destination = database_sidecar_path(db_path, self.suffix);
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(destination)?;
+        source.file.seek(SeekFrom::Start(0))?;
+        std::io::copy(&mut source.file, &mut file)?;
+        drop(file);
+        self.verify_copy(db_path)
+    }
+
+    fn verify_copy(&self, db_path: &Path) -> Result<()> {
+        let path = database_sidecar_path(db_path, self.suffix);
+        let mut copy = StableSchemaSource::open_optional(&path, "private snapshot component")?;
+        let digest = copy
+            .as_mut()
+            .map(|source| snapshot_digest(&mut source.file))
+            .transpose()?;
+        if digest != self.digest {
+            return Err(BeadsError::SyncConflict {
+                message: format!(
+                    "Private recovery changed database payload {}",
+                    path.display()
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
+fn capture_read_snapshot_family(path: &Path) -> Result<Vec<ReadSnapshotMember>> {
+    std::iter::once("")
+        .chain(crate::config::db_sidecar_suffixes().copied())
+        .map(|suffix| {
+            let member_path = database_sidecar_path(path, suffix);
+            let mut source =
+                StableSchemaSource::open_optional(&member_path, "read snapshot component")?;
+            let metadata = source
+                .as_ref()
+                .map(|source| source.file.metadata())
+                .transpose()?;
+            // Copying would turn a foreign-owned or multiply linked namespace
+            // file into an owned, single-link file and hide engine admission
+            // failures. Classify the retained original before private recovery.
+            #[cfg(unix)]
+            if crate::config::FSQLITE_NAMESPACE_SIDECAR_SUFFIXES.contains(&suffix)
+                && let Some(metadata) = metadata.as_ref()
+            {
+                use std::os::unix::fs::MetadataExt;
+
+                if metadata.uid() != effective_uid() || metadata.nlink() != 1 {
+                    return Err(BeadsError::SyncConflict {
+                        message: format!(
+                            "Refusing unsafe fsqlite namespace sidecar {}: uid {} and {} hard links; expected current uid {} and exactly one link",
+                            member_path.display(),
+                            metadata.uid(),
+                            metadata.nlink(),
+                            effective_uid(),
+                        ),
+                    });
+                }
+            }
+            let digest = source
+                .as_mut()
+                .map(|source| snapshot_digest(&mut source.file))
+                .transpose()?;
+            Ok(ReadSnapshotMember {
+                path: member_path,
+                suffix,
+                source,
+                metadata,
+                digest,
+            })
+        })
+        .collect()
+}
+
+fn verify_read_snapshot_family(family: &mut [ReadSnapshotMember]) -> Result<()> {
+    for member in family {
+        member.verify_source()?;
+    }
+    Ok(())
+}
+
+fn missing_read_only_wal_index(path: &Path) -> Result<bool> {
+    let shm = StableSchemaSource::open_optional(&database_sidecar_path(path, "-shm"), "SHM")?;
+    if shm.is_some() {
+        return Ok(false);
+    }
+    Ok(
+        StableSchemaSource::open_optional(&database_sidecar_path(path, "-wal"), "WAL")?
+            .is_some_and(|source| source.initial_len > 0),
+    )
+}
+
 /// A regular schema-family file held open through byte inspection.
 ///
 /// Unix opens are no-follow and retain the inode. Windows opens retain the
@@ -17148,19 +17399,69 @@ fn wal_checksum(bytes: &[u8], mut s1: u32, mut s2: u32, big_endian_words: bool) 
 /// after the last commit are ignored. Header and valid page-one corruption are
 /// still hard failures because accepting either would manufacture schema
 /// authority that SQLite itself does not provide.
+fn sqlite_wal_schema_preflight(db_path: &Path) -> Result<WalSchemaPreflight> {
+    scan_wal_schema_preflight(db_path, None)
+}
+
+/// Validate every physical WAL frame before rebuilding a missing shared index.
+/// The caller must retain database-family authority throughout validation and
+/// recovery. Checksums establish internal consistency, not foreign-WAL ownership.
+pub(crate) fn validate_wal_for_index_recovery(db_path: &Path) -> Result<()> {
+    let mut source = StableSchemaSource::open_optional(db_path, "database")?.ok_or_else(|| {
+        BeadsError::SyncConflict {
+            message: "WAL index recovery requires an existing database".to_string(),
+        }
+    })?;
+    let mut header = [0_u8; 100];
+    source.file.read_exact(&mut header)?;
+    let encoded_size = u16::from_be_bytes([header[16], header[17]]);
+    let page_size = if encoded_size == 1 {
+        65_536
+    } else {
+        u32::from(encoded_size)
+    };
+    if &header[..16] != b"SQLite format 3\0"
+        || !(512..=65_536).contains(&page_size)
+        || !page_size.is_power_of_two()
+    {
+        return Err(BeadsError::SyncConflict {
+            message: "WAL index recovery requires a valid database header and page size"
+                .to_string(),
+        });
+    }
+    scan_wal_schema_preflight(db_path, Some(page_size))?;
+    source.file.seek(SeekFrom::Start(0))?;
+    let mut after = [0_u8; 100];
+    source.file.read_exact(&mut after)?;
+    if after != header {
+        return Err(BeadsError::SyncConflict {
+            message: "Database header changed during WAL index recovery validation".to_string(),
+        });
+    }
+    source.verify_path(db_path, "database")
+}
+
 // Keep the complete fail-closed recovery scan together so its retained-handle
 // verification and schema-authority transitions remain auditable in order.
 #[allow(clippy::too_many_lines)]
-fn sqlite_wal_schema_preflight(db_path: &Path) -> Result<WalSchemaPreflight> {
+fn scan_wal_schema_preflight(
+    db_path: &Path,
+    recovery_page_size: Option<u32>,
+) -> Result<WalSchemaPreflight> {
     let wal_path = database_sidecar_path(db_path, "-wal");
     let Some(mut wal_source) = StableSchemaSource::open_optional(&wal_path, "WAL")? else {
+        if recovery_page_size.is_some() {
+            return Err(BeadsError::SyncConflict {
+                message: "WAL index recovery requires an existing WAL".to_string(),
+            });
+        }
         return Ok(WalSchemaPreflight {
             committed_user_version: None,
             has_committed_frames: false,
         });
     };
     let wal_len = wal_source.initial_len;
-    if wal_len == 0 {
+    if wal_len == 0 && recovery_page_size.is_none() {
         wal_source.verify_path(&wal_path, "WAL")?;
         return Ok(WalSchemaPreflight {
             committed_user_version: None,
@@ -17216,6 +17517,19 @@ fn sqlite_wal_schema_preflight(db_path: &Path) -> Result<WalSchemaPreflight> {
 
     let frame_size = u64::from(page_size) + 24;
     let frame_bytes = wal_len - 32;
+    if let Some(expected_size) = recovery_page_size {
+        if expected_size != page_size {
+            return Err(BeadsError::SyncConflict {
+                message: "WAL page size disagrees with the database during index recovery"
+                    .to_string(),
+            });
+        }
+        if frame_bytes % frame_size != 0 {
+            return Err(BeadsError::SyncConflict {
+                message: "WAL index recovery refuses a partial frame tail".to_string(),
+            });
+        }
+    }
     let page_size_usize = usize::try_from(page_size).map_err(|_| BeadsError::SyncConflict {
         message: "WAL page size does not fit this platform".to_string(),
     })?;
@@ -17242,6 +17556,13 @@ fn sqlite_wal_schema_preflight(db_path: &Path) -> Result<WalSchemaPreflight> {
             u32::from_be_bytes(frame[12..16].try_into().unwrap_or([0; 4])),
         );
         if frame_salts != header_salts {
+            if recovery_page_size.is_some() {
+                return Err(BeadsError::SyncConflict {
+                    message: format!(
+                        "WAL index recovery refuses frame {frame_index} with mismatched salts"
+                    ),
+                });
+            }
             break;
         }
         let checksum_after_header = wal_checksum(
@@ -17261,6 +17582,13 @@ fn sqlite_wal_schema_preflight(db_path: &Path) -> Result<WalSchemaPreflight> {
             u32::from_be_bytes(frame[20..24].try_into().unwrap_or([0; 4])),
         );
         if stored_frame_checksum != expected_frame_checksum {
+            if recovery_page_size.is_some() {
+                return Err(BeadsError::SyncConflict {
+                    message: format!(
+                        "WAL index recovery refuses frame {frame_index} with invalid checksum"
+                    ),
+                });
+            }
             break;
         }
         running_checksum = expected_frame_checksum;
@@ -18088,6 +18416,20 @@ pub struct IssueUpdate {
     pub claim_exclusive: bool,
     /// The actor performing the claim (used for idempotent same-actor check).
     pub claim_actor: Option<String>,
+    /// Optimistic-concurrency precondition: the `updated_at` the caller read
+    /// before composing this update (GitHub #500).
+    ///
+    /// `description`, `design` and `notes` are prose fields that callers
+    /// rewrite whole, so the normal edit is read-modify-write. Two of those
+    /// against one store lose the first writer's revision: the second writer's
+    /// base is stale, and its value is a legitimate-looking revision of the
+    /// same text, so no comparison of the two values can tell the difference.
+    /// The distinguishing fact is whether the writer's base was current, which
+    /// lives in the record rather than in either value.
+    ///
+    /// Checked inside the write transaction, alongside `expect_unassigned`.
+    /// Doing it before the transaction would leave the same window open.
+    pub expect_updated_at: Option<DateTime<Utc>>,
 }
 
 impl IssueUpdate {
@@ -18120,6 +18462,14 @@ impl IssueUpdate {
             && self.transition_comment.is_none()
             && self.workflow_policy_bypass_reason.is_none()
             && !self.expect_unassigned
+            // A precondition is not a field change, but it must still be
+            // *checked*, and the only place that happens is inside the write
+            // transaction this flag gates (GitHub #500). Reporting such an
+            // update as empty skipped the check while a label, parent or
+            // acceptance edit — which are applied outside `IssueUpdate` —
+            // went ahead anyway, which is precisely the write the caller
+            // asked to make conditional.
+            && self.expect_updated_at.is_none()
     }
 }
 
@@ -21159,8 +21509,10 @@ impl Drop for SqliteStorage {
                 }
             }
         }
-        // Explicitly close the connection to avoid fsqlite drop_close warnings.
-        let _ = self.conn.close_in_place();
+        // Engine close normally performs its own passive checkpoint. It must
+        // not bypass the sole-opener admission above or checkpoint a read-only
+        // command's handle. Transaction cleanup still runs without a checkpoint.
+        let _ = self.conn.close_without_checkpoint_in_place();
         drop(exit_hold);
         // Ephemeral temp databases (open_memory) are unlinked here, after the
         // connection is closed, so the file and its WAL/SHM/journal sidecars are
@@ -33204,6 +33556,291 @@ required_fields:
     }
 
     #[test]
+    fn missing_wal_index_recovery_preserves_valid_wal_only_pending_receipt() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("pending_wal_only.db");
+        let wal_path = database_sidecar_path(&db_path, "-wal");
+        let shm_path = database_sidecar_path(&db_path, "-shm");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        storage
+            .conn
+            .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
+        storage.conn.execute("PRAGMA wal_autocheckpoint=0").unwrap();
+        assert!(storage.pending_sync_merge_receipt().unwrap().is_none());
+        let checkpointed_main = fs::read(&db_path).unwrap();
+        let sentinel = "valid pending merge committed only in WAL";
+        let issue = make_issue(
+            "bd-wal-pending",
+            sentinel,
+            Status::Open,
+            2,
+            None,
+            Utc.with_ymd_and_hms(2026, 7, 27, 7, 0, 0).unwrap(),
+            None,
+        );
+        let kept = [issue];
+        let intent = sync_merge_test_intent(&storage, &kept, &[], &[]);
+        storage
+            .apply_sync_merge_atomically(&kept, &[], &[], &intent)
+            .unwrap();
+        let expected = storage.inspect_pending_sync_merge().unwrap();
+        assert!(matches!(&expected, PendingSyncMergeInspection::Valid(_)));
+        let peer = crate::sync::DatabaseOpenerLease::register(&db_path).unwrap();
+        drop(storage);
+        drop(peer);
+        let main_before = fs::read(&db_path).unwrap();
+        let wal_before = fs::read(&wal_path).unwrap();
+        // A receipt can span several database pages and WAL frame headers, so
+        // its serialized bytes need not be contiguous in the WAL. Equality of
+        // the entire main file with its receipt-free pre-state proves neither
+        // the new issue nor receipt was checkpointed; recovery must yield the
+        // exact valid receipt below, including every field and witness.
+        assert_eq!(
+            main_before, checkpointed_main,
+            "peer presence must prevent every exit-time checkpoint"
+        );
+        assert!(
+            !main_before
+                .windows(sentinel.len())
+                .any(|bytes| bytes == sentinel.as_bytes())
+        );
+        assert!(
+            wal_before
+                .windows(sentinel.len())
+                .any(|bytes| bytes == sentinel.as_bytes())
+        );
+        fs::rename(&shm_path, temp.path().join("retained-matching-shm")).unwrap();
+        let mut source_witness = capture_read_snapshot_family(&db_path).unwrap();
+        let readonly = SqliteStorage::open_current_read_only(&db_path)
+            .expect("private recovered read snapshot")
+            .expect("current schema snapshot");
+        assert_eq!(readonly.inspect_pending_sync_merge().unwrap(), expected);
+        assert_eq!(
+            readonly.get_issue("bd-wal-pending").unwrap().unwrap().title,
+            sentinel
+        );
+        assert!(readonly.read_snapshot_dir.is_some());
+        assert!(
+            !shm_path.exists(),
+            "private reads must not rebuild the live index"
+        );
+        verify_read_snapshot_family(&mut source_witness).unwrap();
+        drop(readonly);
+        verify_read_snapshot_family(&mut source_witness).unwrap();
+        let authority = Arc::new(
+            crate::sync::blocking_database_family_write_lock_with_timeout(
+                temp.path(),
+                &db_path,
+                Some(1_000),
+            )
+            .unwrap(),
+        );
+        crate::cli::commands::doctor_subsystems::schema_migration::recover_missing_wal_index(
+            temp.path(),
+            &db_path,
+            &authority,
+        )
+        .unwrap();
+        assert!(shm_path.is_file());
+        assert_eq!(
+            SqliteStorage::inspect_pending_sync_merge_under_authority(&db_path, &authority)
+                .unwrap(),
+            expected,
+            "index recovery must preserve the exact valid pending receipt",
+        );
+        assert_eq!(fs::read(&db_path).unwrap(), main_before);
+        assert_eq!(fs::read(&wal_path).unwrap(), wal_before);
+    }
+
+    #[test]
+    fn private_read_snapshot_refuses_changed_family() {
+        for change in ["bytes", "appeared", "replaced"] {
+            let temp = TempDir::new().unwrap();
+            let db_path = temp.path().join("snapshot.db");
+            fs::write(&db_path, b"original bytes").unwrap();
+            let mut captured = capture_read_snapshot_family(&db_path).unwrap();
+            match change {
+                "bytes" => fs::write(&db_path, b"modified bytes").unwrap(),
+                "appeared" => {
+                    fs::write(database_sidecar_path(&db_path, "-shm"), b"new index").unwrap();
+                }
+                "replaced" => {
+                    fs::rename(&db_path, temp.path().join("retained-original")).unwrap();
+                    fs::write(&db_path, b"original bytes").unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                verify_read_snapshot_family(&mut captured).is_err(),
+                "{change}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_read_snapshot_refuses_hardlinked_namespace_with_missing_shm() {
+        use std::os::unix::fs::MetadataExt;
+
+        for suffix in crate::config::FSQLITE_NAMESPACE_SIDECAR_SUFFIXES {
+            let temp = TempDir::new().unwrap();
+            let db_path = temp.path().join("snapshot.db");
+            let storage = SqliteStorage::open(&db_path).unwrap();
+            storage
+                .conn
+                .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                .unwrap();
+            storage.conn.execute("PRAGMA wal_autocheckpoint=0").unwrap();
+            let main_before_write = fs::read(&db_path).unwrap();
+            storage.conn.execute("INSERT INTO metadata (key, value) VALUES ('snapshot_sentinel', 'committed WAL-only value')").unwrap();
+            drop(storage);
+            assert_eq!(fs::read(&db_path).unwrap(), main_before_write);
+            assert!(
+                sqlite_wal_schema_preflight(&db_path)
+                    .unwrap()
+                    .has_committed_frames
+            );
+            validate_wal_for_index_recovery(&db_path).unwrap();
+            let shm_path = database_sidecar_path(&db_path, "-shm");
+            fs::rename(&shm_path, temp.path().join("retained-shm")).unwrap();
+            let namespace_path = database_sidecar_path(&db_path, suffix);
+            let alias = temp.path().join("namespace-alias");
+            fs::hard_link(&namespace_path, &alias).unwrap();
+            let metadata = fs::metadata(&namespace_path).unwrap();
+            assert_eq!(metadata.nlink(), 2);
+            let family_before = directory_bytes_and_modes(temp.path());
+
+            let error = SqliteStorage::open_current_read_only(&db_path)
+                .expect_err("private copying must not bypass namespace admission");
+            assert!(error.to_string().contains("2 hard links"), "{error}");
+            assert!(!shm_path.exists());
+            assert_eq!(directory_bytes_and_modes(temp.path()), family_before);
+            for path in [&namespace_path, &alias] {
+                let after = fs::metadata(path).unwrap();
+                assert_eq!((after.dev(), after.ino()), (metadata.dev(), metadata.ino()));
+                assert_eq!(after.nlink(), 2);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_read_snapshot_refuses_namespace_symlink() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("snapshot.db");
+        fs::write(&db_path, b"original bytes").unwrap();
+        let target = temp.path().join("external");
+        fs::write(&target, b"do not touch").unwrap();
+        let suffix = crate::config::db_sidecar_suffixes().last().unwrap();
+        std::os::unix::fs::symlink(&target, database_sidecar_path(&db_path, suffix)).unwrap();
+        assert!(capture_read_snapshot_family(&db_path).is_err());
+        assert_eq!(fs::read(target).unwrap(), b"do not touch");
+    }
+
+    #[test]
+    fn wal_index_recovery_accepts_engine_committed_wal() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("engine_wal.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        storage.conn.execute("PRAGMA wal_autocheckpoint=0").unwrap();
+        storage
+            .conn
+            .execute("CREATE TABLE recovery_sentinel(value TEXT)")
+            .unwrap();
+        storage
+            .conn
+            .execute("INSERT INTO recovery_sentinel VALUES ('committed WAL row')")
+            .unwrap();
+        let wal_path = database_sidecar_path(&db_path, "-wal");
+        let before_main = fs::read(&db_path).unwrap();
+        let before_wal = fs::read(&wal_path).unwrap();
+        assert!(before_wal.len() > 32, "fixture must include WAL frames");
+        validate_wal_for_index_recovery(&db_path).unwrap();
+        assert!(
+            sqlite_wal_schema_preflight(&db_path)
+                .unwrap()
+                .has_committed_frames
+        );
+        assert_eq!(fs::read(&db_path).unwrap(), before_main);
+        assert_eq!(fs::read(&wal_path).unwrap(), before_wal);
+        assert_eq!(
+            storage
+                .conn
+                .query_row("SELECT value FROM recovery_sentinel")
+                .unwrap()
+                .get(0),
+            Some(&SqliteValue::Text("committed WAL row".into())),
+        );
+    }
+
+    #[test]
+    fn wal_index_recovery_validates_complete_family_without_mutation() {
+        let salts = (0x1020_3040, 0x5060_7080);
+        for case in [
+            "header",
+            "committed",
+            "header_checksum",
+            "frame_checksum",
+            "salts",
+            "partial",
+            "page_size",
+        ] {
+            let temp = TempDir::new().unwrap();
+            let db_path = temp.path().join("validation.db");
+            let wal_path = database_sidecar_path(&db_path, "-wal");
+            let mut main = vec![0_u8; 512];
+            main[..16].copy_from_slice(b"SQLite format 3\0");
+            main[16..18].copy_from_slice(&512_u16.to_be_bytes());
+            let (mut wal, mut checksum) = synthetic_wal_header(salts);
+            if case != "header" {
+                append_synthetic_wal_frame(&mut wal, &mut checksum, 1, 1, salts, Some(73));
+            }
+            let expected_error = match case {
+                "header_checksum" => {
+                    wal[24] ^= 1;
+                    Some("header checksum")
+                }
+                "frame_checksum" => {
+                    wal[32 + 24 + 100] ^= 1;
+                    Some("invalid checksum")
+                }
+                "salts" => {
+                    wal[32 + 8] ^= 1;
+                    Some("mismatched salts")
+                }
+                "partial" => {
+                    wal.push(0);
+                    Some("partial frame")
+                }
+                "page_size" => {
+                    main[16..18].copy_from_slice(&1024_u16.to_be_bytes());
+                    Some("page size disagrees")
+                }
+                _ => None,
+            };
+            fs::write(&db_path, &main).unwrap();
+            fs::write(&wal_path, &wal).unwrap();
+            let result = validate_wal_for_index_recovery(&db_path);
+            if let Some(expected) = expected_error {
+                let error = result.expect_err(case);
+                assert!(error.to_string().contains(expected), "{case}: {error}");
+            } else {
+                result.expect(case);
+                assert_eq!(
+                    sqlite_wal_schema_preflight(&db_path)
+                        .unwrap()
+                        .committed_user_version,
+                    if case == "committed" { Some(73) } else { None },
+                );
+            }
+            assert_eq!(fs::read(&db_path).unwrap(), main, "{case}: main changed");
+            assert_eq!(fs::read(&wal_path).unwrap(), wal, "{case}: WAL changed");
+            assert!(!database_sidecar_path(&db_path, "-shm").exists());
+        }
+    }
+
+    #[test]
     fn test_wal_preflight_stops_at_reused_or_partial_crash_tail() {
         let salts = (0x1020_3040, 0x5060_7080);
         for tail_kind in ["reused", "partial"] {
@@ -37118,6 +37755,7 @@ required_fields:
             write_authority: None,
             mutation_count: 0,
             temp_db_path: None,
+            read_snapshot_dir: None,
             pending_event_attribution: None,
             opener_lease: None,
             workflow_capacity_policy: crate::close_policy::CapacityPolicy::default(),

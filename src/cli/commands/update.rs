@@ -388,6 +388,21 @@ pub fn execute_with_storage(
         target_inputs.push(last_touched);
     }
 
+    // A single `updated_at` describes one record, so applying it to a batch
+    // would be nonsense in both directions: it cannot hold for several issues
+    // at once, and silently checking it against only the first would give the
+    // rest exactly the false assurance the flag exists to remove (#500).
+    if args.if_unchanged.is_some() && target_inputs.len() > 1 {
+        return Err(BeadsError::validation_with_hint(
+            "if-unchanged",
+            format!(
+                "--if-unchanged applies to one issue, but {} were given",
+                target_inputs.len()
+            ),
+            "Run one `br update --if-unchanged` per issue, each with that issue's own updated_at.",
+        ));
+    }
+
     let routed_batches = config::routing::group_issue_inputs_by_route(&target_inputs, &beads_dir)?;
 
     let (updated_issues, render_items, ordered_resolved_ids, mut capacity_warnings) =
@@ -638,6 +653,21 @@ fn prepare_single_route_with_storage(
     let actor = config::resolve_actor(&config_layer);
     let resolver = build_resolver(&config_layer, &storage_ctx.storage);
     let resolved_ids = resolve_target_ids(args, beads_dir, &resolver, &storage_ctx.storage)?;
+
+    // The caller-facing guard in `execute_with_storage` counts the inputs;
+    // this one counts what they actually resolved to, which is the number
+    // that matters. One `updated_at` describes one record (#500).
+    if args.if_unchanged.is_some() && resolved_ids.len() > 1 {
+        return Err(BeadsError::validation_with_hint(
+            "if-unchanged",
+            format!(
+                "--if-unchanged applies to one issue, but the given input resolved to {}: {}",
+                resolved_ids.len(),
+                resolved_ids.join(", ")
+            ),
+            "Run one `br update --if-unchanged` per issue, each with that issue's own updated_at.",
+        ));
+    }
 
     let claim_exclusive = config::claim_exclusive_from_layer(&config_layer);
     let update = build_update(args, &actor, claim_exclusive)?;
@@ -1184,10 +1214,6 @@ fn validate_route_runtime_guards(
             let issue = storage
                 .get_issue(id)?
                 .ok_or_else(|| BeadsError::IssueNotFound { id: id.clone() })?;
-            // Every route must pass lifecycle checks before any route writes.
-            // Storage repeats this under its transaction, but that is too late
-            // to prevent an earlier workspace from committing on a routed call.
-            SqliteStorage::validate_claim_target(&issue, chrono::Utc::now())?;
             let trimmed = issue
                 .assignee
                 .as_deref()
@@ -1255,6 +1281,8 @@ fn validate_transition_to_in_progress(
             let Some(issue) = storage.get_issue(id)? else {
                 continue;
             };
+            // Validate every route before any route writes. Storage repeats
+            // this inside its transaction, after earlier routes may commit.
             SqliteStorage::validate_claim_target(&issue, chrono::Utc::now())?;
         }
     }
@@ -1861,7 +1889,57 @@ fn build_update(args: &UpdateArgs, actor: &str, claim_exclusive: bool) -> Result
         } else {
             None
         },
+        expect_updated_at: parse_if_unchanged(args.if_unchanged.as_deref())?,
     })
+}
+
+/// Parse `--if-unchanged` into the instant the caller read (GitHub #500).
+///
+/// Compared as an instant rather than a string, so any equivalent RFC 3339
+/// spelling of the same moment is accepted — `br show --json` emits
+/// nanosecond precision, and a caller that round-trips the value through a
+/// tool which normalises the offset or trims trailing zeros should not be
+/// told the record moved when it did not.
+fn parse_if_unchanged(value: Option<&str>) -> Result<Option<DateTime<Utc>>> {
+    parse_if_unchanged_surface(value, "--if-unchanged", "`br show <id> --json`")
+}
+
+/// The same parse for a caller whose surface is not the CLI flag (GitHub #505).
+///
+/// The MCP `update_issue` tool takes `if_unchanged` as a field and its readers
+/// call `show_issue`, so a message naming `--if-unchanged` and `br show` sends
+/// an agent looking for a flag it cannot pass. `surface` is the spelling the
+/// caller used and `read_with` names where the value comes from; the structured
+/// error's field is `surface` without its leading dashes.
+pub(crate) fn parse_if_unchanged_surface(
+    value: Option<&str>,
+    surface: &str,
+    read_with: &str,
+) -> Result<Option<DateTime<Utc>>> {
+    let Some(raw) = value else {
+        return Ok(None);
+    };
+    let field = surface.trim_start_matches('-');
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(BeadsError::validation_with_hint(
+            field,
+            format!("{surface} needs the updated_at you read; it was empty"),
+            format!("Take it from {read_with} (the `updated_at` field)."),
+        ));
+    }
+    DateTime::parse_from_rfc3339(trimmed)
+        .map(|parsed| Some(parsed.with_timezone(&Utc)))
+        .map_err(|err| {
+            BeadsError::validation_with_hint(
+                field,
+                format!("{surface} value {trimmed:?} is not an RFC 3339 timestamp: {err}"),
+                format!(
+                    "Pass the `updated_at` from {read_with} verbatim, e.g. \
+                     2026-09-17T02:22:26.950413390Z."
+                ),
+            )
+        })
 }
 
 #[allow(clippy::option_option, clippy::single_option_map)]
@@ -2063,6 +2141,72 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
     use tracing::info;
+
+    // === Lost-update precondition (GitHub #500) ===
+
+    #[test]
+    fn if_unchanged_accepts_what_show_json_emits() {
+        // `br show --json` emits nanosecond precision; the flag has to take
+        // that value back verbatim or the feature is unusable.
+        let parsed = parse_if_unchanged(Some("2026-09-17T02:22:26.950413390Z"))
+            .expect("parses")
+            .expect("present");
+        assert_eq!(
+            parsed.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+            "2026-09-17T02:22:26.950413390Z"
+        );
+    }
+
+    #[test]
+    fn if_unchanged_compares_instants_not_spellings() {
+        // The same moment written three ways must not read as "the record
+        // moved" — a caller may round-trip the token through a tool that
+        // normalises the offset.
+        let z = parse_if_unchanged(Some("2026-09-17T02:22:26.5Z"))
+            .unwrap()
+            .unwrap();
+        let offset_zero = parse_if_unchanged(Some("2026-09-17T02:22:26.5+00:00"))
+            .unwrap()
+            .unwrap();
+        let other_zone = parse_if_unchanged(Some("2026-09-16T22:22:26.5-04:00"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(z, offset_zero);
+        assert_eq!(z, other_zone);
+
+        // Surrounding whitespace is a shell artefact, not a different instant.
+        assert_eq!(
+            parse_if_unchanged(Some("  2026-09-17T02:22:26.5Z  "))
+                .unwrap()
+                .unwrap(),
+            z
+        );
+    }
+
+    #[test]
+    fn if_unchanged_absent_is_not_a_precondition() {
+        assert!(parse_if_unchanged(None).unwrap().is_none());
+    }
+
+    #[test]
+    fn if_unchanged_rejects_unusable_values_with_a_hint() {
+        // Silently ignoring a malformed token would hand back exactly the
+        // false assurance the flag exists to remove.
+        for bad in ["", "   ", "not-a-time", "2026-09-17", "1789520379"] {
+            let err = parse_if_unchanged(Some(bad))
+                .expect_err(&format!("{bad:?} must not parse as a precondition"));
+            let structured = crate::error::StructuredError::from_error(&err);
+            assert_eq!(
+                structured.code,
+                crate::error::ErrorCode::ValidationFailed,
+                "{bad:?} -> {structured:?}"
+            );
+            assert!(
+                structured.hint.is_some_and(|h| h.contains("br show")),
+                "{bad:?} should point at where the token comes from"
+            );
+        }
+    }
 
     // === In-place acceptance checklist edits (GitHub #477) ===
 

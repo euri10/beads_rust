@@ -85,6 +85,76 @@ this repo): commits `55c186682` + `5946b3b7c` in
 
 ## Unreleased
 
+- **Restore concurrent startup with the published storage engine.** Upgrade
+  FrankenSQLite facade/core to 0.4.2, pager to 0.4.3 and btree/vdbe to 0.4.1.
+  Read-only WAL admission now avoids the exclusive maintenance conflict that
+  could stall CLI reads and refuse MCP startup during pending-sync inspection.
+  The existing br opener leases and checkpoint containment remain in force.
+  Workstreams `beads_rust-otrgz` and `beads_rust-nx2sh`; qualification and
+  remaining release gates are recorded in [the upgrade log](UPGRADE_LOG.md).
+- **Honor peer-opener checkpoint exclusion during storage teardown.** Closing
+  a storage handle no longer invokes an implicit engine checkpoint after br
+  has declined checkpointing because peers are present. The existing
+  sole-opener check continues to govern exit-time checkpoints.
+- **Keep opener protection during long recovery and competing checkpoints.**
+  New opens now fail safely after the five-second admission deadline instead
+  of entering an exclusively held database without a lease. Competing
+  checkpoint attempts retain peer protection, and an exclusive hold restores
+  shared registration when dropped. If restoration fails, a retained
+  transition lock continues to prevent peer checkpoints.
+  ([lease ownership](https://github.com/Dicklesworthstone/beads_rust/commit/3015fb0f),
+  [regressions](https://github.com/Dicklesworthstone/beads_rust/commit/238f2300))
+- **Protect doctor repairs from peer checkpoints.** Index repair and explicit
+  WAL truncation require sole-opener admission. Partial REINDEX and the
+  rollback-only write probe retain shared opener registration and disable
+  automatic checkpoints during commit and close. Workstream `beads_rust-otrgz.3`.
+  ([index repair](https://github.com/Dicklesworthstone/beads_rust/commit/b74ad74f),
+  [automatic checkpoint exclusion](https://github.com/Dicklesworthstone/beads_rust/commit/8785215b))
+- **Recover a missing WAL shared index during ordinary startup.** Reads and
+  writes can reopen valid WAL-backed databases whose `-shm` index is missing.
+  Recovery requires a sole opener, validates the complete WAL, preserves a
+  backup, and verifies unchanged database/WAL/journal bytes before startup
+  checks the actual pending-merge receipt. Doctor, explicit read-only commands,
+  and observational sync can inspect a verified private snapshot while leaving
+  the live database family unchanged. Workstream `beads_rust-otrgz.2`.
+  ([startup recovery](https://github.com/Dicklesworthstone/beads_rust/commit/868d658d),
+  [WAL validation](https://github.com/Dicklesworthstone/beads_rust/commit/db088c21))
+- **Refresh CLI parsing and completion dependencies.** Update the coupled
+  clap packages to 4.6.7 and clap_complete to 4.6.11, preserving the existing
+  CLI features and dynamic completion defaults. This does not enable clap's
+  opt-in deferred command initialization.
+  ([clap update](https://github.com/Dicklesworthstone/beads_rust/commit/3d0eb2dd),
+  [completion update](https://github.com/Dicklesworthstone/beads_rust/commit/ae5b95bd))
+- **Patch TLS handshake validation.** Rustls 0.23.45 addresses
+  [RUSTSEC-2026-0285](https://rustsec.org/advisories/RUSTSEC-2026-0285.html)
+  without changing the engine or Asupersync versions.
+
+- **Use published dependencies for MCP-enabled installations.** FastMCP
+  0.10.0 replaces the Git-only pin, retaining the existing Asupersync runtime
+  version and incorporating upstream cancellation-drain fixes. Published
+  crate archives now exclude local test-evidence artifacts.
+  [806819f9](https://github.com/Dicklesworthstone/beads_rust/commit/806819f9)
+  All-feature Clippy and compilation of an extracted crate passed on the
+  0.4.4 engine tree; see [qualification receipts](UPGRADE_LOG.md). This is
+  source qualification, not a new package publication or native release proof.
+
+- **Recover legacy engine read admission before schema migration.**
+  `doctor migrate-schema recover` preserves the complete database family,
+  rehearses recovery on a private copy, and performs an identity-bound live
+  open only under write authority and a sole-opener lease. The main database,
+  WAL, and journal must remain unchanged; the recovered logical state must
+  match the rehearsal. Planning remains read-only. See the
+  [migration reference](docs/CLI_REFERENCE.md#reviewed-schema-migration)
+  and workstream `beads_rust-otrgz.1`.
+
+- **Refuse deferred claims before writing to any routed workspace.** A mixed
+  claim containing a deferred target no longer claims earlier valid issues
+  before returning an error. This also applies with `--force`.
+
+- **Preserve engine migration state during database recovery.** Snapshots,
+  recovery backups, failed-rebuild restoration and orphan quarantine now carry
+  `.fsqlite-migration-state` with its database family.
+
 - **Preserve the current JSONL export on broken exchange filesystems.**
   Before replacing an existing export, `sync` checks that disposable sibling
   files really exchange identities through the pinned parent directory. A
