@@ -1,6 +1,8 @@
 mod common;
 
-use common::cli::{BrWorkspace, extract_json_payload, run_br, run_br_with_stdin};
+use common::cli::{
+    BrRun, BrWorkspace, extract_json_payload, run_br, run_br_with_env, run_br_with_stdin,
+};
 use serde_json::{Value, json};
 use std::fs;
 use toon_rust::options::ExpandPathsMode;
@@ -96,6 +98,36 @@ fn coordination_json(workspace: &BrWorkspace, args: &[&str], label: &str) -> Val
         result.stderr
     );
     serde_json::from_str(&extract_json_payload(&result.stdout)).expect("coordination json")
+}
+
+/// Run one `suggested_commands` entry the way an operator following the advice
+/// would, and no other way.
+///
+/// The string must not reach a shell: `PATH` inside the harness still points at
+/// whatever `br` is installed on the machine, so `sh -c` would exercise the
+/// released binary instead of the one under test. Split it into argv, expand the
+/// documented `$AGENT_NAME` placeholder as a shell would, and hand the rest to
+/// the test binary.
+fn run_generated_br_command(
+    workspace: &BrWorkspace,
+    command: &str,
+    agent_name: &str,
+    label: &str,
+) -> BrRun {
+    let words = shell_words::split(command).expect("suggested command splits as shell words");
+    let (program, args) = words
+        .split_first()
+        .expect("suggested command should name a program");
+    assert_eq!(
+        program, "br",
+        "suggested commands should invoke br: {command}"
+    );
+
+    let args: Vec<String> = args
+        .iter()
+        .map(|arg| arg.replace("$AGENT_NAME", agent_name))
+        .collect();
+    run_br_with_env(workspace, &args, [("AGENT_NAME", agent_name)], label)
 }
 
 fn write_snapshot_files(workspace: &BrWorkspace) -> (String, String) {
@@ -303,9 +335,10 @@ fn coordination_status_emits_reclaim_commands_only_after_snapshot_clears_policy(
     );
     assert_eq!(stale["reclaim_allowed_by_policy"], true);
     assert_eq!(stale["required_human_confirmation"], false);
-    assert_eq!(commands.len(), 2);
+    assert_eq!(commands.len(), 3);
     assert_eq!(commands[0]["purpose"], "add_reclaim_audit_comment");
-    assert_eq!(commands[1]["purpose"], "claim_issue");
+    assert_eq!(commands[1]["purpose"], "requeue_stale_assignee");
+    assert_eq!(commands[2]["purpose"], "claim_issue");
     assert!(
         commands[0]["command"]
             .as_str()
@@ -313,6 +346,11 @@ fn coordination_status_emits_reclaim_commands_only_after_snapshot_clears_policy(
     );
     assert!(
         commands[1]["command"]
+            .as_str()
+            .is_some_and(|command| command.contains("br update"))
+    );
+    assert!(
+        commands[2]["command"]
             .as_str()
             .is_some_and(|command| command.contains("br update"))
     );
@@ -329,6 +367,120 @@ fn coordination_status_emits_reclaim_commands_only_after_snapshot_clears_policy(
             "audit command should include {expected}"
         );
     }
+}
+
+/// The reclaim advisory exists to be run, so run it.
+///
+/// Asserting that the emitted strings merely contain `br update` hid
+/// louiselm-8elc.1 for a release: classification is read-only and leaves the
+/// abandoned assignee in place, so the generated sequence ended in an atomic
+/// `--claim` that the retained assignee made impossible. An operator following
+/// machine-generated advice hit a dead end and had to discover the requeue step
+/// on their own.
+#[test]
+fn coordination_reclaim_sequence_executes_and_transfers_ownership() {
+    let _log = common::test_log("coordination_reclaim_sequence_executes_and_transfers_ownership");
+    let workspace = BrWorkspace::new();
+    seed_coordination_workspace(&workspace);
+    let reservations = write_empty_reservations(&workspace);
+    let reclaimer = "swarm/JadeOtter";
+
+    let json = coordination_json(
+        &workspace,
+        &[
+            "coordination",
+            "status",
+            "--json",
+            "--owner-kind",
+            "swarm-agent",
+            "--reservations",
+            &reservations,
+        ],
+        "coordination_reclaim_sequence_advisory",
+    );
+    let stale = claim_by_id(&json, "bd-stale");
+    assert_eq!(stale["assessment"]["classification"], "abandoned_likely");
+    assert_eq!(stale["reclaim_allowed_by_policy"], true);
+
+    // The guard the fix must not weaken: an atomic claim on its own still
+    // refuses the retained assignee, which is why the sequence needs the
+    // requeue step rather than a more permissive `--claim`.
+    let direct_claim = run_br(
+        &workspace,
+        [
+            "update", "bd-stale", "--claim", "--actor", reclaimer, "--json",
+        ],
+        "coordination_reclaim_sequence_direct_claim_refused",
+    );
+    assert!(
+        !direct_claim.status.success(),
+        "bare --claim should refuse an assigned issue: stdout={} stderr={}",
+        direct_claim.stdout,
+        direct_claim.stderr
+    );
+    assert!(
+        format!("{}{}", direct_claim.stdout, direct_claim.stderr)
+            .contains("already assigned to AmberLion"),
+        "refusal should name the retained assignee: stdout={} stderr={}",
+        direct_claim.stdout,
+        direct_claim.stderr
+    );
+
+    for (index, command) in stale["suggested_commands"]
+        .as_array()
+        .expect("suggested commands")
+        .iter()
+        .enumerate()
+    {
+        let rendered = command["command"].as_str().expect("command string");
+        let purpose = command["purpose"].as_str().expect("command purpose");
+        let run = run_generated_br_command(
+            &workspace,
+            rendered,
+            reclaimer,
+            &format!("coordination_reclaim_sequence_{index}_{purpose}"),
+        );
+        assert!(
+            run.status.success(),
+            "suggested command {index} ({purpose}) failed: command={rendered} stdout={} stderr={}",
+            run.stdout,
+            run.stderr
+        );
+    }
+
+    let reclaimed = coordination_json(
+        &workspace,
+        &["show", "bd-stale", "--json"],
+        "coordination_reclaim_sequence_result",
+    );
+    assert_eq!(reclaimed[0]["status"], "in_progress");
+    assert_eq!(
+        reclaimed[0]["assignee"], reclaimer,
+        "the sequence should transfer ownership to the agent named in the audit comment"
+    );
+
+    // The audit comment is written before ownership moves, so it has to survive
+    // the requeue; otherwise the evidence for the takeover is gone.
+    let comments = coordination_json(
+        &workspace,
+        &["comments", "list", "bd-stale", "--json"],
+        "coordination_reclaim_sequence_comments",
+    );
+    let texts = comments
+        .as_array()
+        .expect("comments array")
+        .iter()
+        .filter_map(|comment| comment["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        texts.contains("reclaim: previous in_progress claim appears abandoned"),
+        "reclaim audit comment should survive the requeue: {texts}"
+    );
+    assert!(
+        texts.contains("reservation_status=no_reservation"),
+        "audit comment should keep the evidence that justified the takeover: {texts}"
+    );
 }
 
 #[test]
@@ -381,7 +533,7 @@ fn coordination_status_expired_reservation_from_degraded_comment_still_allows_re
     assert!(stale["evidence_summary"].as_str().is_some_and(|summary| {
         summary.contains("reservation_status=expired(holder=OtherAgent,released_at=2020-01-01")
     }));
-    assert_eq!(commands.len(), 2);
+    assert_eq!(commands.len(), 3);
     assert!(
         commands[0]["command"]
             .as_str()

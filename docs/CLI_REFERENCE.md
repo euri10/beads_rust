@@ -891,9 +891,10 @@ issue status or assignee.
 JSON/TOON claim rows include advisory fields:
 `reclaim_allowed_by_policy`, `required_human_confirmation`,
 `evidence_summary`, and `suggested_commands`. Suggested commands are emitted
-only when the policy has enough evidence to propose the documented audit-comment
-plus `br update --claim` sequence. Fresh claims, active reservations, missing or
-invalid snapshots, and human/unknown ownership do not emit reclaim commands.
+only when the policy has enough evidence to propose the documented audit comment,
+requeue (`--status open --assignee ''`), and atomic `--claim` sequence. Fresh claims,
+active reservations, missing or invalid snapshots, and human/unknown ownership do
+not emit reclaim commands.
 
 **Examples:**
 ```bash

@@ -317,10 +317,11 @@ editing the same files, or the dirty tree contains unclear overlapping changes.
 When reclaiming abandoned work, leave an audit comment before touching files:
 
 ```bash
-br comments add <id> --author "$BD_ACTOR" \
+br comments add <id> --author "$AGENT_NAME" \
   --message "reclaim: previous in_progress claim appears abandoned; evidence: updated_at=<timestamp>, assignee=<name>, no active reservation or pane" \
   --json
-br update <id> --claim --json
+br update <id> --status open --assignee '' --actor "$AGENT_NAME" --json
+br update <id> --claim --actor "$AGENT_NAME" --json
 ```
 
 If Agent Mail is down, include the intended file scope in the same comment or a
@@ -383,20 +384,22 @@ Safe reclaim is still a manual, auditable sequence. Review
 br coordination status --reservations reservations.jsonl --agents agents.jsonl --json \
   | jq '.claims[] | {id: .issue.id, action: .assessment.recommended_action, reclaim_allowed_by_policy, required_human_confirmation, suggested_commands}'
 
-br comments add <id> --author "$BD_ACTOR" \
+br comments add <id> --author "$AGENT_NAME" \
   --message "reclaim: previous in_progress claim appears abandoned; evidence: updated_at=<timestamp>, assignee=<name>, no active reservation or pane" \
   --json
-br update <id> --claim --json
+br update <id> --status open --assignee '' --actor "$AGENT_NAME" --json
+br update <id> --claim --actor "$AGENT_NAME" --json
 ```
 
-Only run the final two commands when the advisory output and human policy allow
+Only run the final three commands when the advisory output and human policy allow
 it. `br coordination status` never auto-reclaims, never runs git, and never
 creates or releases Agent Mail reservations.
 
 The output is advisory only. `reclaim_allowed_by_policy=true` means the local
-policy and supplied snapshot evidence allow the documented audit-comment plus
-claim sequence. `suggested_commands` is empty for fresh claims, active
-reservations, missing or malformed snapshots, and human or unknown owners.
+policy and supplied snapshot evidence allow the documented audit, requeue, and
+claim sequence. Requeue clears the retained assignee; ordinary `--claim` refuses
+to overwrite an assigned issue. `suggested_commands` is empty for fresh claims,
+active reservations, missing or malformed snapshots, and human or unknown owners.
 `required_human_confirmation=true` means ask the owner or operator instead of
 copying a claim command.
 

@@ -85,7 +85,7 @@ Each claim assessment includes:
 Each claim row also includes advisory-only reclaim guidance:
 
 - `reclaim_allowed_by_policy`: true only when the shared policy has enough
-  evidence to suggest the audit-comment plus claim sequence for a swarm-agent
+  evidence to suggest the audit, requeue, and claim sequence for a swarm-agent
   claim.
 - `required_human_confirmation`: true for human or unknown owners that are old
   enough to inspect but must not be reclaimed automatically.
@@ -212,14 +212,18 @@ audit comment before any claim update:
 br comments add <id> --author "$AGENT_NAME" \
   --message "reclaim: previous in_progress claim appears abandoned; evidence: updated_at=<timestamp>, assignee=<name>, no active reservation or pane" \
   --json
-br update <id> --claim --json
+br update <id> --status open --assignee '' --actor "$AGENT_NAME" --json
+br update <id> --claim --actor "$AGENT_NAME" --json
 ```
 
 Human or unknown ownership keeps the safer `ask_owner` recommendation even after
 the stale threshold.
 
 `br coordination status` can emit the same sequence in `suggested_commands`, but
-only as an advisory. It never executes either command. The first suggested
-command is always the audit comment; only then does the second command show
-`br update <id> --claim --json`. Operators should still review the evidence and
-confirm any external pane/process state that `br` cannot observe.
+only as an advisory. It never executes these commands. The audit comment comes
+first, then requeue clears the retained assignee, then the atomic claim takes
+ownership. Classification alone never clears an assignee, and ordinary
+`--claim` still refuses to overwrite one. Operators must review current evidence
+and confirm external pane/process state before requeueing: the requeue command
+does not revalidate the snapshot or protect a holder who changed since it was
+captured. Stop if ownership or liveness has changed.

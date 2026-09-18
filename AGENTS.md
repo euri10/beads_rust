@@ -639,14 +639,21 @@ reservations. Use `updated_at`, `assignee`, any session/pane/agent identity in
 comments, and named file scopes as evidence. If the previous owner may still be
 working, choose another ready bead or ask the human operator.
 
-When reclaiming, leave an audit comment first, then claim:
+When reclaiming, leave an audit comment first, requeue the issue, then claim:
 
 ```bash
 br comments add <id> --author "$AGENT_NAME" \
   --message "reclaim: previous in_progress claim appears abandoned; evidence: updated_at=<timestamp>, assignee=<name>, no active reservation or pane" \
   --json
-br update <id> --claim --json
+br update <id> --status open --assignee '' --actor "$AGENT_NAME" --json
+br update <id> --claim --actor "$AGENT_NAME" --json
 ```
+
+The requeue step is not optional. `--claim` is atomic and refuses any issue that
+still has an assignee, and classifying a claim as abandoned is read-only — it
+never clears one. Skipping the requeue means the claim fails with `already
+assigned to <old owner>`. `br coordination status` emits these three commands in
+this order as its `suggested_commands`, so run them as given.
 
 If Agent Mail is unavailable, add or include the degraded-coordination intended
 file scope before editing. The newest assignee owns the claim, but if the old

@@ -178,8 +178,8 @@ RUST_LOG=error br coordination status \
   --json
 ```
 
-Safe reclaim remains a two-step manual sequence. Review advisory output first,
-then copy the suggested audit comment and claim command only when policy allows
+Safe reclaim remains a three-step manual sequence. Review advisory output first,
+then run the suggested audit comment, requeue, and claim only when policy allows
 it:
 
 ```bash

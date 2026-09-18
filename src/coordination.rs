@@ -220,6 +220,10 @@ impl RecommendedAction {
 pub enum CoordinationSuggestedCommandPurpose {
     /// Record the reclaim evidence before touching ownership.
     AddReclaimAuditComment,
+    /// Release the abandoned assignee so the atomic claim has a free issue to
+    /// take. Classification is read-only and never clears it, and `--claim`
+    /// refuses any assigned issue, so without this step the sequence cannot run.
+    RequeueStaleAssignee,
     /// Claim the issue after the audit comment is recorded.
     ClaimIssue,
 }
@@ -654,6 +658,15 @@ fn optional_timestamp(timestamp: Option<&DateTime<Utc>>) -> String {
     timestamp.map_or_else(|| "none".to_string(), ToString::to_string)
 }
 
+/// Build the reconciliation sequence an operator runs verbatim, in order.
+///
+/// The order is load-bearing. The audit comment goes first, while the evidence
+/// that justifies the takeover is still true. The requeue then releases the
+/// abandoned assignee, because classification is read-only and `--claim` refuses
+/// any assigned issue — emitting the claim alone left the sequence impossible to
+/// follow (louiselm-8elc.1). Every step is attributed to the same
+/// `$AGENT_NAME`, so the agent named in the audit comment is the one that ends
+/// up owning the issue.
 fn reclaim_suggested_commands(
     issue_id: &str,
     evidence_summary: &str,
@@ -671,8 +684,18 @@ fn reclaim_suggested_commands(
             ),
         },
         CoordinationSuggestedCommand {
+            purpose: CoordinationSuggestedCommandPurpose::RequeueStaleAssignee,
+            command: format!(
+                "br update {} --status open --assignee '' --actor \"$AGENT_NAME\" --json",
+                shell_quote(issue_id)
+            ),
+        },
+        CoordinationSuggestedCommand {
             purpose: CoordinationSuggestedCommandPurpose::ClaimIssue,
-            command: format!("br update {} --claim --json", shell_quote(issue_id)),
+            command: format!(
+                "br update {} --claim --actor \"$AGENT_NAME\" --json",
+                shell_quote(issue_id)
+            ),
         },
     ]
 }
@@ -1167,13 +1190,17 @@ mod tests {
 
         assert!(advisory.reclaim_allowed_by_policy);
         assert!(!advisory.required_human_confirmation);
-        assert_eq!(advisory.suggested_commands.len(), 2);
+        assert_eq!(advisory.suggested_commands.len(), 3);
         assert_eq!(
             advisory.suggested_commands[0].purpose,
             CoordinationSuggestedCommandPurpose::AddReclaimAuditComment
         );
         assert_eq!(
             advisory.suggested_commands[1].purpose,
+            CoordinationSuggestedCommandPurpose::RequeueStaleAssignee
+        );
+        assert_eq!(
+            advisory.suggested_commands[2].purpose,
             CoordinationSuggestedCommandPurpose::ClaimIssue
         );
         assert!(
@@ -1181,7 +1208,14 @@ mod tests {
                 .command
                 .contains("br comments add")
         );
-        assert!(advisory.suggested_commands[1].command.contains("br update"));
+        assert_eq!(
+            advisory.suggested_commands[1].command,
+            "br update 'bd-stale' --status open --assignee '' --actor \"$AGENT_NAME\" --json"
+        );
+        assert_eq!(
+            advisory.suggested_commands[2].command,
+            "br update 'bd-stale' --claim --actor \"$AGENT_NAME\" --json"
+        );
         assert!(
             advisory.suggested_commands[0]
                 .command
@@ -1212,6 +1246,70 @@ mod tests {
 
         assert!(!advisory.reclaim_allowed_by_policy);
         assert!(advisory.suggested_commands.is_empty());
+    }
+
+    /// The requeue step clears an assignee, so it must never be suggested for a
+    /// claim whose owner might still be working. Age is not permission: every
+    /// classification other than a swarm reclaim candidate gets no sequence at
+    /// all, however old the claim is.
+    #[test]
+    fn advisory_withholds_the_reclaim_sequence_from_protected_classifications() {
+        let protected = [
+            (
+                ClaimClassification::Fresh,
+                assess_claim(input(
+                    30,
+                    ClaimOwnerKind::SwarmAgent,
+                    ReservationEvidence::NoReservation,
+                )),
+            ),
+            (
+                ClaimClassification::BlockedByActiveReservation,
+                assess_claim(input(
+                    8 * 60,
+                    ClaimOwnerKind::SwarmAgent,
+                    ReservationEvidence::Active {
+                        holder: "TopazFox".to_string(),
+                        expires_at: None,
+                        provenance: None,
+                    },
+                )),
+            ),
+            (
+                ClaimClassification::Ambiguous,
+                assess_claim(input(
+                    8 * 60,
+                    ClaimOwnerKind::SwarmAgent,
+                    ReservationEvidence::InvalidSnapshot {
+                        reason: "missing holder field".to_string(),
+                    },
+                )),
+            ),
+            (
+                ClaimClassification::NoMailSnapshot,
+                assess_claim(input(
+                    8 * 60,
+                    ClaimOwnerKind::SwarmAgent,
+                    ReservationEvidence::NoSnapshot,
+                )),
+            ),
+        ];
+
+        for (expected, assessment) in protected {
+            assert_eq!(
+                assessment.classification, expected,
+                "fixture should produce {expected:?}"
+            );
+            let advisory = advisory_for_claim("bd-stale", &assessment);
+            assert!(
+                !advisory.reclaim_allowed_by_policy,
+                "{expected:?} must not clear reclaim policy"
+            );
+            assert!(
+                advisory.suggested_commands.is_empty(),
+                "{expected:?} must not emit a reconciliation sequence"
+            );
+        }
     }
 
     #[test]

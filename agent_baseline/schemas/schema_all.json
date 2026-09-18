@@ -1955,6 +1955,11 @@
               "const": "add_reclaim_audit_comment"
             },
             {
+              "description": "Release the abandoned assignee so the atomic claim has a free issue to\ntake. Classification is read-only and never clears it, and `--claim`\nrefuses any assigned issue, so without this step the sequence cannot run.",
+              "type": "string",
+              "const": "requeue_stale_assignee"
+            },
+            {
               "description": "Claim the issue after the audit comment is recorded.",
               "type": "string",
               "const": "claim_issue"
@@ -2697,6 +2702,11 @@
               "description": "Record the reclaim evidence before touching ownership.",
               "type": "string",
               "const": "add_reclaim_audit_comment"
+            },
+            {
+              "description": "Release the abandoned assignee so the atomic claim has a free issue to\ntake. Classification is read-only and never clears it, and `--claim`\nrefuses any assigned issue, so without this step the sequence cannot run.",
+              "type": "string",
+              "const": "requeue_stale_assignee"
             },
             {
               "description": "Claim the issue after the audit comment is recorded.",
