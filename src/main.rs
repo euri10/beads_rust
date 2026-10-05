@@ -78,7 +78,13 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
         }
     };
 
-    let storage_enabled = ctx.is_initialized() && !ctx.no_db();
+    // The last-touched file records who touched the issue so an id-less
+    // mutation never silently acts on another actor's work (GitHub #518).
+    if let Some(layer) = ctx.config.as_ref() {
+        beads_rust::util::set_process_actor(&config::resolve_actor(layer));
+    }
+
+    let mut storage_enabled = ctx.is_initialized() && !ctx.no_db();
     let mut should_auto_import_now =
         command_supports_auto_import && !cli.allow_stale && !ctx.no_auto_import();
     let should_auto_flush_now = is_mutating && !ctx.no_auto_flush();
@@ -106,23 +112,29 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
     // command itself is the sole mutation allowed to resume that state; doctor
     // owns a richer dedicated finding/refusal surface.
     let pending_merge_disposition = pending_merge_startup_disposition(&cli.command);
-    // A valid WAL may outlive its regenerable SHM index. Restore only that
-    // index under write + sole-opener authority, with a verified private
-    // rehearsal and unchanged durable payloads, before classifying the real
-    // pending receipt. Explicit read-only opens never take this repair path.
+    // A valid WAL may outlive its regenerable SHM index, or #507's exact
+    // initialized-zero-page poison may leave that index permanently unusable,
+    // as does the never-initialized or other-generation index an engine that
+    // kept its index in memory leaves behind (br 0.6.0, GH #521).
+    // Recover any such derived-cache state under write + sole-opener authority,
+    // with a verified private rehearsal and unchanged durable payloads, before
+    // classifying the real pending receipt. Explicit read-only opens never take
+    // this repair path.
     let observational_startup = (ctx.overrides.read_only_fast_open
         && cli.no_auto_import
         && cli.no_auto_flush)
         || matches!(cli.command, Commands::Doctor(_))
         || matches!(&cli.command, Commands::Sync(args) if args.status || (args.reconcile && args.dry_run));
-    let startup_recovery_lock = if storage_enabled
+    let mut startup_recovery_lock = if storage_enabled
         && !observational_startup
         && (command_needs_write_lock
             || should_preopen_storage
             || pending_merge_disposition == PendingMergeStartupDisposition::Refuse)
         && let Some((beads_dir, paths)) = ctx.beads_dir.as_deref().zip(ctx.paths.as_ref())
-        && commands::doctor_subsystems::schema_migration::missing_wal_index(&paths.db_path)?
-    {
+        && (commands::doctor_subsystems::schema_migration::torn_wal_present(&paths.db_path)?
+            || commands::doctor_subsystems::schema_migration::wal_index_needs_recovery(
+                &paths.db_path,
+            )?) {
         let authority = Arc::new(
             beads_rust::sync::blocking_database_family_write_lock_with_timeout(
                 beads_dir,
@@ -130,7 +142,18 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
                 ctx.startup_write_lock_timeout(&cli.command),
             )?,
         );
-        commands::doctor_subsystems::schema_migration::recover_missing_wal_index(
+        // A WAL shorter than its header holds no frames; set it aside before
+        // any index recovery or engine open so it can never wedge startup.
+        if let Some(quarantine) =
+            commands::doctor_subsystems::schema_migration::quarantine_torn_wal_for_startup(
+                beads_dir,
+                &paths.db_path,
+                &authority,
+            )?
+        {
+            emit_torn_wal_quarantine_warning(&quarantine, json_error_mode);
+        }
+        commands::doctor_subsystems::schema_migration::recover_wal_index_for_startup(
             beads_dir,
             &paths.db_path,
             &authority,
@@ -139,6 +162,83 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
     } else {
         None
     };
+    // A database left on an older schema refuses every ordinary command.
+    // When the audit proves nothing lives only in the database, upgrade it
+    // here (reviewed migration or JSONL rebuild, backup retained) and carry
+    // on; otherwise mutations refuse with the one command that resolves it,
+    // and read-only commands fall back to reading the JSONL directly.
+    if storage_enabled
+        && !matches!(cli.command, Commands::Doctor(_) | Commands::Init { .. })
+        && (command_needs_write_lock
+            || should_preopen_storage
+            || command_supports_auto_import
+            || supports_read_only_fast_open(&cli.command))
+        && let Some((beads_dir, paths)) = ctx.beads_dir.clone().zip(ctx.paths.clone())
+        && let Ok(Some(found)) =
+            commands::doctor_subsystems::schema_heal::stale_schema_version(&paths.db_path)
+    {
+        let refusal = if observational_startup {
+            // Explicitly read-only invocations never rewrite the database.
+            Some(stale_schema_observational_refusal(found))
+        } else {
+            let authority = match startup_recovery_lock.as_ref() {
+                Some(authority) => Arc::clone(authority),
+                None => Arc::new(
+                    beads_rust::sync::blocking_database_family_write_lock_with_timeout(
+                        &beads_dir,
+                        &paths.db_path,
+                        ctx.startup_write_lock_timeout(&cli.command),
+                    )?,
+                ),
+            };
+            let heal_ctx = commands::doctor_subsystems::schema_heal::HealContext {
+                beads_dir: &beads_dir,
+                cli: &overrides,
+                write_authority: &authority,
+            };
+            let result = commands::doctor_subsystems::schema_heal::heal_stale_schema(
+                &heal_ctx,
+                commands::doctor_subsystems::schema_heal::HealMode::Automatic,
+            );
+            // A fresh authority must be released before the ordinary startup
+            // lock below: flock is per open file description, so the same
+            // process would block on itself.
+            drop(authority);
+            match result {
+                Ok(commands::doctor_subsystems::schema_heal::HealResult::NotNeeded) => None,
+                Ok(commands::doctor_subsystems::schema_heal::HealResult::Healed(outcome)) => {
+                    eprintln!("{}", outcome.notice());
+                    None
+                }
+                Ok(commands::doctor_subsystems::schema_heal::HealResult::Refused(audit)) => Some(
+                    commands::doctor_subsystems::schema_heal::refusal_error(&audit),
+                ),
+                // A failed upgrade leaves the old family in place; read-only
+                // commands still fall back to the JSONL below.
+                Err(error) => Some(error),
+            }
+        };
+        if let Some(refusal) = refusal {
+            if !supports_read_only_fast_open(&cli.command) {
+                return Err(refusal);
+            }
+            eprintln!(
+                "warning: {refusal}. This read-only command reads issues.jsonl directly instead \
+                 (as with --no-db)."
+            );
+            overrides.no_db = Some(true);
+            ctx.overrides.no_db = Some(true);
+            overrides.read_only_fast_open = false;
+            ctx.overrides.read_only_fast_open = false;
+            if let Some(layer) = ctx.config.as_mut() {
+                layer.merge_from(&overrides.as_layer());
+            }
+            storage_enabled = false;
+            should_auto_import_now = false;
+            should_preopen_storage = false;
+            startup_recovery_lock = None;
+        }
+    }
     let mut pending_merge_warning_emitted = false;
     if ctx.is_initialized()
         && !ctx.no_db()
@@ -321,7 +421,8 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
             Err(error) => {
                 return Err(BeadsError::SyncConflict {
                     message: format!(
-                        "Refusing no-DB mutation because pending sync-merge state could not be inspected under database-family authority: {error}"
+                        "Refusing no-DB mutation because pending sync-merge state could not be inspected under database-family authority: {}",
+                        pending_merge_inspection_failure(&error)
                     ),
                 });
             }
@@ -372,7 +473,8 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
             Err(error) => {
                 return Err(BeadsError::SyncConflict {
                     message: format!(
-                        "Refusing storage open because pending sync-merge state could not be inspected under database-family authority: {error}"
+                        "Refusing storage open because pending sync-merge state could not be inspected under database-family authority: {}",
+                        pending_merge_inspection_failure(&error)
                     ),
                 });
             }
@@ -1384,6 +1486,23 @@ fn reviewed_schema_migration_required(source: BeadsError) -> BeadsError {
     source.reviewed_schema_migration_required()
 }
 
+/// Refusal for an explicitly read-only invocation that found a stale schema:
+/// such invocations never rewrite the database, so name the heal instead.
+fn stale_schema_observational_refusal(found: u32) -> BeadsError {
+    BeadsError::WithContext {
+        context: format!(
+            "the tracker database is on schema {found} and explicitly read-only invocations \
+             never upgrade it; any ordinary br command upgrades it automatically when nothing \
+             exists only in the database, or run `{}`",
+            commands::doctor_subsystems::schema_heal::HEAL_COMMAND
+        ),
+        source: Box::new(BeadsError::SchemaMismatch {
+            expected: beads_rust::storage::schema::CURRENT_SCHEMA_VERSION,
+            found: i32::try_from(found).unwrap_or(i32::MAX),
+        }),
+    }
+}
+
 fn pending_sync_merge_no_db_refusal_error(
     state: &commands::doctor::PendingSyncMergeState,
 ) -> BeadsError {
@@ -1510,6 +1629,39 @@ fn apply_fast_open_auto_import_reprobe(
     }
 }
 
+fn emit_torn_wal_quarantine_warning(
+    quarantine: &commands::doctor_subsystems::schema_migration::TornWalQuarantine,
+    json_mode: bool,
+) {
+    let message = format!(
+        "Moved a torn {}-byte WAL sidecar (shorter than its 32-byte header, so it held no \
+         committed frames) out of the database family; the database file is intact",
+        quarantine.wal_length
+    );
+    let retained: Vec<String> = quarantine
+        .quarantined_paths
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect();
+    if json_mode {
+        let payload = serde_json::json!({
+            "level": "warning",
+            "code": "torn_wal_quarantined",
+            "message": message,
+            "retained_paths": retained,
+        });
+        eprintln!(
+            "{}",
+            serde_json::to_string(&payload).unwrap_or_else(|_| payload.to_string())
+        );
+    } else {
+        eprintln!(
+            "warning: {message}. Original bytes retained at: {}",
+            retained.join(", ")
+        );
+    }
+}
+
 fn emit_pending_sync_merge_warning(
     state: &commands::doctor::PendingSyncMergeState,
     json_mode: bool,
@@ -1538,14 +1690,34 @@ fn emit_pending_sync_merge_warning(
     }
 }
 
+/// The inspection failure behind a pending-merge refusal or warning. When the
+/// engine refused on the WAL index (`BusyRecovery`), name the one command
+/// that rebuilds every index shape: ordinary commands fail on the same
+/// refusal, so "restore read access" alone leaves the operator stuck.
+fn pending_merge_inspection_failure(error: &BeadsError) -> String {
+    if error.is_busy_recovery() {
+        format!(
+            "{error}. {}",
+            beads_rust::error::WAL_INDEX_RECOVERY_REMEDIATION
+        )
+    } else {
+        error.to_string()
+    }
+}
+
 fn emit_pending_sync_merge_inspection_warning(error: &BeadsError, json_mode: bool) {
     if json_mode {
+        let remediation = if error.is_busy_recovery() {
+            beads_rust::error::WAL_INDEX_RECOVERY_REMEDIATION
+        } else {
+            "Run `br doctor --json` and restore read-only database-family access before mutating."
+        };
         let payload = serde_json::json!({
             "level": "warning",
             "code": "sync_merge_pending_unknown",
             "message": "Read-only command is proceeding with automatic sync disabled because pending merge state could not be inspected",
             "inspection_error": error.to_string(),
-            "remediation": "Run `br doctor --json` and restore read-only database-family access before mutating."
+            "remediation": remediation
         });
         eprintln!(
             "{}",

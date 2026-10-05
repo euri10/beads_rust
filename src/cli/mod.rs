@@ -974,10 +974,11 @@ EXAMPLES:
     /// Undefer issues (make ready again)
     Undefer(UndeferArgs),
 
+    // Boxed: `UpdateArgs` is the largest argument struct by a wide margin,
+    // and keeping it inline would size every `Commands` value to it. This is
+    // a plain `//` comment on purpose: clap turns every `///` paragraph into
+    // `--help` text (GH #516).
     /// Update an issue
-    ///
-    /// Boxed: `UpdateArgs` is the largest argument struct by a wide margin,
-    /// and keeping it inline would size every `Commands` value to it.
     Update(Box<UpdateArgs>),
 
     /// Explicitly inspect Git visibility for the configured JSONL export
@@ -1868,6 +1869,10 @@ pub struct ListArgs {
     #[arg(long, add = ArgValueCompleter::new(label_completer))]
     pub label_any: Vec<String>,
 
+    /// Hide issues carrying this label (can be repeated; any match hides the issue)
+    #[arg(long, value_name = "LABEL", add = ArgValueCompleter::new(label_completer))]
+    pub exclude_label: Vec<String>,
+
     /// Filter by priority: 0-4 or P0-P4, ranges like 0-1, comma lists; repeatable
     #[arg(long, short = 'p', add = ArgValueCompleter::new(priority_completer))]
     pub priority: Vec<String>,
@@ -2597,6 +2602,10 @@ pub struct CountArgs {
     /// Title contains substring
     #[arg(long)]
     pub title_contains: Option<String>,
+
+    /// Hide issues carrying this label (can be repeated; any match hides the issue)
+    #[arg(long, value_name = "LABEL", add = ArgValueCompleter::new(label_completer))]
+    pub exclude_label: Vec<String>,
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy, Eq, PartialEq)]
@@ -2728,6 +2737,10 @@ pub struct ReadyArgs {
     #[arg(long, add = ArgValueCompleter::new(label_completer))]
     pub label_any: Vec<String>,
 
+    /// Hide issues carrying this label (can be repeated; any match hides the issue)
+    #[arg(long, value_name = "LABEL", add = ArgValueCompleter::new(label_completer))]
+    pub exclude_label: Vec<String>,
+
     /// Filter by issue type (can be repeated)
     #[arg(long = "type", short = 't', add = ArgValueCompleter::new(issue_type_completer))]
     pub type_: Vec<String>,
@@ -2769,6 +2782,14 @@ pub struct ReadyArgs {
     /// Show token savings stats when using TOON output
     #[arg(long)]
     pub stats: bool,
+
+    /// Omit long free-text fields from JSON/TOON output, keeping only what is
+    /// needed to choose work (id, title, status, priority, type, timestamps).
+    /// On a 10k-issue tracker this takes `ready --json` from ~1.2 MB to ~110 KB,
+    /// because descriptions alone are ~89% of the default payload. Fetch detail
+    /// for the one issue you pick with `br show <id>`.
+    #[arg(long)]
+    pub brief: bool,
 
     /// Machine-readable output (alias for --json)
     #[arg(long)]
@@ -3034,8 +3055,10 @@ pub struct SyncArgs {
     /// Reconcile JSONL and normalize source_repo_path atomically
     ///
     /// Read-only by default. Builds a hash-bound plan that preserves the
-    /// portable source_repo value, imports source-only/newer rows, and rewrites
-    /// source_repo_path to the canonical current workspace path. Combine with
+    /// portable source_repo value, imports source-only/newer rows, sets the
+    /// database's machine-local source_repo_path to the canonical current
+    /// workspace path, and strips legacy source_repo_path values from the
+    /// JSONL, which never carries the field. Combine with
     /// --apply and the exact --expect-plan-sha256 token to commit DB and JSONL
     /// through the crash-recoverable sync publication saga.
     #[arg(long = "migrate-source-repo-path")]
@@ -3574,6 +3597,33 @@ pub enum DoctorMigrateSchemaCommand {
     Apply(DoctorMigrateSchemaApplyArgs),
     /// Restore the exact pre-migration database family from a completed run.
     Undo(DoctorMigrateSchemaUndoArgs),
+    /// Upgrade a database left on an older schema (any version, including the
+    /// unversioned schema 0 of early br and Go bd), keeping a backup.
+    ///
+    /// Schemas 13-18 use the reviewed in-place migration. Older schemas are
+    /// rebuilt from issues.jsonl; issues that exist only in the database are
+    /// re-added as unflushed changes so the next flush exports them. Ordinary
+    /// commands do this automatically when the database holds nothing the
+    /// JSONL lacks; this command is for the case they refuse.
+    Heal(DoctorMigrateSchemaHealArgs),
+}
+
+/// Arguments for `br doctor migrate-schema heal`.
+#[derive(Args, Debug, Clone, Default)]
+pub struct DoctorMigrateSchemaHealArgs {
+    /// Print the audit (database-only issues and the planned action) without
+    /// changing anything.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Do not re-add database-only issues after a rebuild; they remain only
+    /// in the retained backup.
+    #[arg(long)]
+    pub discard_db_only: bool,
+
+    /// Emit a machine-readable receipt.
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// Arguments for `br doctor migrate-schema recover`.
@@ -3820,6 +3870,47 @@ mod tests {
     use tempfile::TempDir;
 
     const CLI_REFERENCE: &str = include_str!("../../docs/CLI_REFERENCE.md");
+
+    /// GitHub #516: clap turns every `///` paragraph on a subcommand variant
+    /// into `--help` text, so implementation notes about the `Commands` enum
+    /// layout leaked into `br update --help`. Guard every (sub)command's
+    /// about/long-about against developer-only notes.
+    #[test]
+    fn test_help_text_has_no_internal_code_notes() {
+        fn walk(cmd: &clap::Command, path: &str, offenders: &mut Vec<String>) {
+            for text in [cmd.get_about(), cmd.get_long_about()]
+                .into_iter()
+                .flatten()
+            {
+                let text = text.to_string();
+                let leaks =
+                    text.contains("Boxed") || text.contains("`Commands`") || text.contains("Args`");
+                if leaks {
+                    offenders.push(format!("{path}: {text}"));
+                }
+            }
+            for sub in cmd.get_subcommands() {
+                walk(sub, &format!("{path} {}", sub.get_name()), offenders);
+            }
+        }
+
+        let cmd = Cli::command();
+        let mut offenders = Vec::new();
+        walk(&cmd, "br", &mut offenders);
+        assert!(
+            offenders.is_empty(),
+            "help text leaks internal code notes:\n{}",
+            offenders.join("\n")
+        );
+        let update = cmd
+            .find_subcommand("update")
+            .expect("update subcommand exists");
+        assert!(
+            update.get_long_about().is_none(),
+            "`br update --help` should have no long description, got {:?}",
+            update.get_long_about().map(ToString::to_string)
+        );
+    }
 
     #[test]
     fn test_list_limit_is_none_when_omitted() {

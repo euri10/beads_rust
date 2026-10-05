@@ -14,8 +14,7 @@ This changelog is organized by capability rather than diff order. Each version s
 - Release links: `https://github.com/Dicklesworthstone/beads_rust/releases/tag/<TAG>`
 
 **Scope window:** every version from inception (v0.1.0, 2026-01-18) through the current
-release (v0.6.0, 2026-09-12), including the source frozen at
-[b1cfebe0](https://github.com/Dicklesworthstone/beads_rust/commit/b1cfebe0).
+release (v0.7.4, 2026-10-01).
 The full per-version detail is in the sections below; the timeline names the
 recent line and the milestone anchors. The September 8 audit examined all 79
 commits in `v0.5.10..v0.5.11` and six subsequent commits against Git diffs,
@@ -32,6 +31,11 @@ explicitly corrected during this audit.
 
 | Version | Date | Kind | Headline |
 |---|---|---|---|
+| [v0.7.4](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.7.4) | 2026-10-01 | Release | `--exclude-label` for list/ready/search/count (#522); FrankenSQLite 0.4.7, so reads after a SQLite reader such as bv no longer copy the database; bounded `.br_recovery` and `.br-wal-index-*` retention; provenance-backed create entry routes (#503); "recovery in progress" names `br doctor migrate-schema recover` |
+| [v0.7.3](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.7.3) | 2026-09-29 | Release | Read-only commands (`--no-auto-import --no-auto-flush`, the form bv generates) no longer fail with "recovery in progress" after a SQLite reader such as bv opened the tracker |
+| [v0.7.2](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.7.2) | 2026-09-29 | Release | WAL-index recovery no longer locked out by pre-existing index damage, and warns when rows may be lost (#523); `br update` reports label changes (#527) |
+| [v0.7.1](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.7.1) | 2026-09-28 | Release | Workspaces upgraded from 0.6.0 no longer wedge on a stale WAL index (#521); Windows WAL-index recovery no longer blocks every command (#520); older-schema databases self-heal (`doctor migrate-schema heal`); id-less mutation, coordination, epic close-policy and `policy.yaml` unknown-key fixes |
+| [v0.7.0](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.7.0) | 2026-09-24 | Release | FrankenSQLite 0.4.4 engine; id-collision-safe `sync --merge` and import refusal (#512); empty-JSONL merge guard; `update --if-unchanged` (#500/#505); poisoned WAL-index recovery (#507); Unicode-correct search; `ready --brief`, `list/search --fields` |
 | [v0.6.0](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.6.0) | 2026-09-12 | Release | Prerequisite checklists, class-specific workflow routes, typed dependencies, reviewed migrations, claim/admission guards, bounded ready output; seven-platform DSR release |
 | [v0.5.12](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.5.12) | 2026-09-09 | Release | Closed-claim refusal; bounded search page loading; terminal color controls; namespace diagnostics; Nix source repair; seven-platform DSR release |
 | [v0.5.11](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.5.11) | 2026-09-08 | Release | Checkpoints before diagnostic exits; FrankenSQLite 0.3.18 grouped-count fix; migration preflight and typed admission failures; seven-platform DSR release |
@@ -83,10 +87,463 @@ this repo): commits `55c186682` + `5946b3b7c` in
 
 ---
 
-## Unreleased
+## v0.7.4 — 2026-10-01
 
-- **Restore concurrent startup with the published storage engine.** Upgrade
-  FrankenSQLite facade/core to 0.4.2, pager to 0.4.3 and btree/vdbe to 0.4.1.
+[Release](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.7.4).
+A patch release. The database schema is unchanged at 19.
+
+### Label exclusion for list, ready, search and count (#522)
+
+- `br list`, `br ready`, `br search` and `br count` accept
+  `--exclude-label <label>`, repeatable. An issue carrying any excluded label
+  is hidden. It composes with `--label` (all of) and `--label-any` (any of):
+  those select, then the exclusion removes. `ready --limit` and the list and
+  search pages apply after the exclusion, so hidden issues never shorten a
+  page, and saved queries (`br query save`) keep the flag. JSON output is
+  unchanged apart from the rows it filters. There is deliberately no config
+  file or environment setting for it: a filter that hides issues by default
+  would change what `br ready` means for every agent in the workspace.
+
+### Provenance-backed entry routes in `policy.yaml` (#503)
+
+- `workflow.entry_routes` lets `br create` skip the global `initial` status
+  for follow-up work. With `- {label: triage, to: open}`, a new issue enters
+  `open` directly when it carries the `triage` label and at least one parent
+  or dependency names an issue that already exists in the tracker. A label
+  alone, a relation alone, an `external:` reference, or a status the route
+  does not name is still refused by the `initial` rule. Routes require strict
+  transition enforcement and an explicit `transitions.initial`; labels and
+  statuses match case-insensitively, and duplicate or undeclared targets are
+  rejected when the policy loads. Imports are not reinterpreted through
+  routes. The storage layer repeats the check inside the create transaction,
+  so every create path applies the same rule.
+
+### `.br_recovery` no longer grows without bound after SQLite reads
+
+- **Every write after a stock SQLite reader (bv, the `sqlite3` shell) opened
+  the tracker copied the whole database twice** into a new
+  `.beads/.br_recovery/schema-migrations/` run, once as the backup and once
+  for the private rehearsal, and nothing ever removed them. When the WAL holds
+  no frames and the index has the zero-page shape SQLite leaves (#507), the
+  main database file is the complete committed state and rebuilding the index
+  cannot change it. Recovery now keeps only the old index plus its receipts in
+  that case, still checks that the main database and WAL come out
+  byte-identical, and still requires a clean integrity check. If the check
+  finds damage that predates the recovery, the original index is put back and
+  the complete-backup rehearsal handles it exactly as before.
+- After each successful recovery, br removes that database's completed
+  recovery runs that are both outside the five newest and older than seven
+  days. Failed and interrupted recovery runs, the run just created, runs of
+  other databases, and schema-migration runs (used by `undo`) are never
+  removed.
+
+### FrankenSQLite 0.4.7; reads after a SQLite reader no longer copy the database
+
+- The engine moves from FrankenSQLite 0.4.4 to 0.4.7 (every fsqlite crate).
+  0.4.7 fixes silent index corruption after a single large multi-row
+  `INSERT ... VALUES` (hfdt-dlkam3) and a race where a schema change beside
+  concurrent writers left rows out of a new index (bd-4iaoi); 0.4.6 fixed a
+  page referenced twice across a WAL generation (bd-b5vmw).
+- 0.4.6+ reads through the empty WAL index stock SQLite writes when it is the
+  first connection to a tracker whose WAL holds no frames (fsqlite GH#431),
+  which is what bv or the `sqlite3` shell leave after every read. Read-only
+  commands (`--no-auto-import --no-auto-flush`, what bv generates) now read
+  the live database there instead of copying the whole family to a private
+  snapshot on every call. The first commit through that index still fails in
+  0.4.7, so the next writing command still rebuilds it with the index-only
+  recovery above. The #507 index beside a WAL that holds frames, and the stale
+  indexes br 0.6.0 left, still read through a private snapshot.
+- The `.br-wal-index-*` directories that each such rebuild leaves beside the
+  database (the index it set aside, about 32 KiB) now follow the recovery-run
+  rule: after a successful recovery, finished ones outside the newest five and
+  older than seven days are removed. A quarantine that failed, never finished,
+  belongs to another database or does not match its own receipt is kept.
+
+### "database is busy (recovery in progress)" names its fix
+
+- Since 0.7.3, read-only commands read around the WAL indexes SQLite readers
+  and br 0.6.0 leave behind, and ordinary commands rebuild them. Any other
+  index the engine refuses (a torn header, a truncated or overwritten
+  `beads.db-shm`) still failed every command, reads and writes alike, with
+  "database is busy (recovery in progress)" and no next step; `br doctor
+  --repair` refused as well. Only `br doctor migrate-schema recover` clears
+  it. The error now says so: as a hint on the error itself, in the
+  pending-merge refusal that writing commands report, in the
+  `sync_merge_pending_unknown` warning's `remediation`, and in the
+  `br doctor --repair` refusal.
+
+### Distribution and verification
+
+- Seven default-feature binaries were built from
+  [3956ebb8](https://github.com/Dicklesworthstone/beads_rust/commit/3956ebb8)
+  on Apple Silicon with the v0.7.3 recipe: macOS amd64/arm64 natively, Linux
+  GNU (glibc 2.28 floor) and static musl on amd64/arm64 with cargo-zigbuild,
+  and Windows amd64 with the GNU toolchain. GitHub Actions were not used.
+- The 24 assets are seven archives, seven SHA-256 sidecars, seven Minisign
+  signatures (key `36B847D11BA5A0D0`), aggregate checksums, and SPDX/CycloneDX
+  source SBOMs. Public downloads matched the checksums and signatures on
+  macOS and Linux, and the installer at the tag installed byte-identical
+  binaries on Apple Silicon and Linux amd64 into scratch prefixes. Every
+  binary reports commit 3956ebb8. The macOS (arm64 and Intel under Rosetta)
+  and Linux amd64 GNU and musl binaries passed a create, dependency, label,
+  `--exclude-label`, close, sync and doctor round trip, then a read-only
+  `show` and a write after a Python `sqlite3` read; the arm64 Linux binaries
+  ran under qemu-user. No Windows host was reachable, so the Windows binary
+  was not run.
+- The in-repo Homebrew, Scoop and AUR manifests point at these assets.
+
+## v0.7.3 — 2026-09-29
+
+[Release](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.7.3).
+A patch release. The database schema is unchanged at 19.
+
+### Read-only commands work after another SQLite program reads the tracker
+
+- **Since 0.7.0, a read-only command failed after bv, the `sqlite3` shell or
+  any other SQLite program had opened `.beads/beads.db`.** Commands run with
+  `--no-auto-import --no-auto-flush`, including the
+  `br --db <path> --no-auto-import --no-auto-flush show --json -- <id>` that
+  bv hands to agents, exited 2 with "database is busy (recovery in
+  progress)" until some command without those flags ran. When SQLite is the
+  first program to open a database whose WAL holds no frames, it rebuilds
+  the WAL index (`beads.db-shm`) and records a page size of zero, because an
+  empty WAL has no frame to take one from. That is the index shape from #507,
+  and FrankenSQLite 0.4.x refuses to read through it. Commands that write
+  already rebuilt it; read-only commands could not. They now read a private
+  copy whose index is rebuilt from the WAL, the same fallback 0.7.1 added for
+  indexes left by br 0.6.0 (#521). A WAL that fails its checksums is still
+  refused, and the live files are not changed. Each such read costs a copy
+  of the database until the next ordinary command rebuilds the live index
+  ([7c12906d](https://github.com/Dicklesworthstone/beads_rust/commit/7c12906d)).
+- `br doctor` names this index state instead of calling `beads.db-shm`
+  inert, and `br doctor --repair` still refuses while it is present; run
+  `br doctor migrate-schema recover` or any ordinary command first
+  ([7c12906d](https://github.com/Dicklesworthstone/beads_rust/commit/7c12906d)).
+
+### Distribution and verification
+
+- Seven default-feature binaries were built from
+  [f925146d](https://github.com/Dicklesworthstone/beads_rust/commit/f925146d)
+  on Apple Silicon with the v0.7.2 recipe: macOS amd64/arm64 natively, Linux
+  GNU (glibc 2.28 floor) and static musl on amd64/arm64 with cargo-zigbuild,
+  and Windows amd64 with the GNU toolchain. GitHub Actions were not used.
+- The 24 assets are seven archives, seven SHA-256 sidecars, seven Minisign
+  signatures (key `36B847D11BA5A0D0`), aggregate checksums, and SPDX/CycloneDX
+  source SBOMs. Public downloads matched the checksums and signatures on
+  macOS and Linux, and the installer at the tag installed byte-identical
+  binaries on Apple Silicon and Linux amd64. Every binary reports commit
+  f925146d. The macOS (arm64 and Intel under Rosetta) and Linux amd64 GNU and
+  musl binaries passed a create, dependency, label, close, sync and doctor
+  round trip; the macOS arm64 and Linux amd64 binaries also passed the bv
+  read-only repro; and the arm64 Linux binaries ran under qemu-user. No Windows host was reachable, so the Windows binary was
+  not run.
+- The in-repo Homebrew, Scoop and AUR manifests point at these assets.
+
+## v0.7.2 — 2026-09-29
+
+[Release](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.7.2).
+A patch release. The database schema is unchanged at 19.
+
+### Damaged indexes no longer lock you out of WAL-index recovery
+
+- **A workspace with a poisoned or stale WAL index (#507, #521) and indexes
+  that were already damaged had no way back in.** Every command ran startup
+  recovery, which rehearses on a private copy and requires a clean integrity
+  check; the old index damage failed that check, so recovery refused.
+  `br doctor migrate-schema recover` refused the same way, and
+  `br doctor --repair` and `--repair-indexes` refused behind the pending-merge
+  check, which needs recovery to have run first. Recovery only rebuilds the
+  WAL index and already proves the database and WAL bytes are unchanged, so
+  damage it finds was there before. When the check fails, recovery now tries
+  the index rebuild that `--repair-indexes` does on another private copy. If
+  that comes back clean with the schema and every row unchanged, the damage is
+  only in the indexes: `br doctor migrate-schema recover` restores access,
+  reports the damage and tells you to run `br doctor --repair-indexes` next.
+  Ordinary commands still refuse to run on indexes known to be broken, but the
+  error names those two commands. Damage the rebuild does not clear keeps
+  recovery closed and says it is not confined to indexes. The live database is
+  not changed by any refusal
+  ([c1d9ea6f](https://github.com/Dicklesworthstone/beads_rust/commit/c1d9ea6f), [#523](https://github.com/Dicklesworthstone/beads_rust/issues/523)).
+- **Recovery warns when the damage may have cost you a row.** If a table has
+  lost a row that its indexes still point to, rebuilding the indexes makes
+  the two agree again, so the check comes back clean, and
+  `--repair-indexes` would then delete the index entries that were the only
+  sign the row existed. When the integrity check shows index entries with no
+  matching table row, the recovery receipt sets
+  `index_corruption.index_entries_without_table_rows`, and both
+  `br doctor migrate-schema recover` and the startup error say rows may have
+  been lost and to check `issues.jsonl` for them before running
+  `--repair-indexes`. The complete pre-recovery files stay under
+  `.beads/.br_recovery/`
+  ([9ce4daa4](https://github.com/Dicklesworthstone/beads_rust/commit/9ce4daa4), [#523](https://github.com/Dicklesworthstone/beads_rust/issues/523)).
+- A failed WAL-index recovery no longer leaves `.br-wal-index-*` preparation
+  directories behind. The directory is kept only when it holds evidence of the
+  poisoned index, and a failure to clean up is reported separately from that
+  evidence
+  ([35c8f40a](https://github.com/Dicklesworthstone/beads_rust/commit/35c8f40a), [#523](https://github.com/Dicklesworthstone/beads_rust/issues/523)).
+- `br doctor` points integrity errors that name an index at
+  `br doctor --repair-indexes`.
+
+**Safe recovery path** for a workspace in this state: stop other `br`
+processes and copy `.beads/` somewhere safe; run
+`br doctor migrate-schema recover`; if it reports that rows may have been
+lost, compare against `issues.jsonl` first; then run
+`br doctor --repair-indexes` and `br doctor`.
+
+### Other fixes
+
+- `br update` reports label changes. `--add-label`, `--remove-label` and
+  `--set-labels` printed nothing, so a label change, a no-op and a mistyped
+  label looked the same. The receipt now has a line such as
+  `labels: +needs-review -triage` with the net change; a label that was
+  already present (or already absent) prints nothing
+  ([d653e423](https://github.com/Dicklesworthstone/beads_rust/commit/d653e423), [#527](https://github.com/Dicklesworthstone/beads_rust/issues/527)).
+- Test-suite fixes for two tests that failed intermittently under parallel
+  test threads
+  ([ab7a740f](https://github.com/Dicklesworthstone/beads_rust/commit/ab7a740f), [b4dbf9d6](https://github.com/Dicklesworthstone/beads_rust/commit/b4dbf9d6)).
+
+### Distribution and verification
+
+- Seven default-feature binaries were built from
+  [3ac74162](https://github.com/Dicklesworthstone/beads_rust/commit/3ac74162)
+  on Apple Silicon: macOS amd64/arm64 natively, Linux GNU (glibc 2.28 floor)
+  and static musl on amd64/arm64 with cargo-zigbuild, and Windows amd64 with
+  the GNU toolchain. GitHub Actions were not used.
+- The 24 assets are seven archives, seven SHA-256 sidecars, seven Minisign
+  signatures (key `36B847D11BA5A0D0`), aggregate checksums, and SPDX/CycloneDX
+  source SBOMs. Public downloads matched the staged bytes, checksums and
+  signatures on macOS and Linux, and the installer at the tag installed
+  byte-identical binaries on Apple Silicon and Linux amd64. Every binary
+  reports commit 3ac74162; the macOS (arm64 and Intel under Rosetta) and
+  Linux amd64 GNU and musl binaries passed a create, dependency, label,
+  close, sync and doctor round trip, and the arm64 Linux binaries ran under
+  qemu-user.
+- The in-repo Homebrew, Scoop and AUR manifests now point at these assets.
+  The v0.7.1 release left them at the v0.7.0 hashes.
+- The v0.7.1 bump also missed `agent_baseline/examples/version.json`, which
+  failed `e2e_schema`; v0.7.2 updates it
+  ([3ac74162](https://github.com/Dicklesworthstone/beads_rust/commit/3ac74162)).
+
+## v0.7.1 — 2026-09-28
+
+[Release](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.7.1).
+A patch release whose main job is to un-wedge workspaces upgraded from 0.6.0.
+The database schema is unchanged at 19.
+
+### Upgrading from 0.6.0 no longer wedges the workspace
+
+- **Every 0.6.0 → 0.7.0 upgrade on Linux and macOS failed** with
+  `database is busy (recovery in progress)` on every command, `br doctor`
+  included, and `br doctor --repair` refused behind the sync-merge gate.
+  br 0.6.0 kept its WAL index in memory and left `.beads/beads.db-shm` with a
+  header it never filled in; the 0.7.0 engine reads that file on Unix, decides
+  the index needs rebuilding, and a read-only open is not allowed to rebuild it.
+  The startup check that looks for a pending sync merge opens read-only, so
+  nothing got past startup. Running 0.6.0 again on a workspace a newer br had
+  opened re-created the problem. Startup now recognises an index the engine can
+  never admit read-only (never initialised, or disagreeing with the WAL header)
+  and rebuilds it with the existing sole-opener recovery: a rehearsal on a
+  private copy, the pre-recovery files kept under `.beads/.br_recovery/`, and a
+  check that the database and WAL bytes are unchanged. Explicitly read-only
+  invocations read through a private snapshot instead of writing the live
+  files. `br doctor` names the stale index instead of calling the file inert
+  ([0ddbb1a0](https://github.com/Dicklesworthstone/beads_rust/commit/0ddbb1a0), [#521](https://github.com/Dicklesworthstone/beads_rust/issues/521)).
+- **If you are on 0.7.0 and hit this**, upgrading to 0.7.1 fixes it on the next
+  command. To recover without upgrading: stop other `br` processes on the
+  workspace and run `br doctor migrate-schema recover`; nothing needs to be
+  deleted. `br --no-db ready` reads `issues.jsonl` directly in the meantime.
+- **Windows: commands no longer fail with "WAL-index quarantine is not
+  supported on this platform".** The Windows engine never reads `-shm`, so
+  br no longer inspects that file's bytes there or starts a recovery it cannot
+  finish ([ba75ac6c](https://github.com/Dicklesworthstone/beads_rust/commit/ba75ac6c), [#520](https://github.com/Dicklesworthstone/beads_rust/issues/520)).
+
+### Databases on an older schema heal themselves
+
+- A tracker left on an older schema used to be refused by every command, and
+  schemas below 13 (early br and Go `bd` databases) had no working upgrade
+  path at all. Startup now audits the old database against `issues.jsonl`.
+  When every issue row is represented in the JSONL, br upgrades and continues
+  (schemas 13–18 through the reviewed migration, older ones by rebuilding from
+  the audited JSONL, with the old files kept in `.beads/.br_recovery`). When
+  some data exists only in the database, mutations refuse and name the issues,
+  read-only commands read the JSONL, and the new
+  `br doctor migrate-schema heal [--dry-run] [--discard-db-only]` performs the
+  upgrade while keeping the database-only issues
+  ([91c61db3](https://github.com/Dicklesworthstone/beads_rust/commit/91c61db3)).
+
+### Other fixes
+
+- An id-less `br close`/`update`/`reopen` no longer acts on the issue another
+  agent touched last: it refuses when the last touch belongs to a different
+  actor, and always in `--json`/robot mode
+  ([bbde2e47](https://github.com/Dicklesworthstone/beads_rust/commit/bbde2e47), [#518](https://github.com/Dicklesworthstone/beads_rust/issues/518)).
+- `br coordination status` counts assigned beads in ready-group statuses (such
+  as `rework`) as claims, and its ready count honours
+  `workflow.status_groups.ready` the way `br ready` does
+  ([f4c8e79e](https://github.com/Dicklesworthstone/beads_rust/commit/f4c8e79e), [#519](https://github.com/Dicklesworthstone/beads_rust/issues/519)).
+- `br epic close-eligible` enforces the close policy that `br close` enforces;
+  any violation refuses the whole batch, and `--dry-run` reports which epics
+  the policy would refuse
+  ([c1b9343c](https://github.com/Dicklesworthstone/beads_rust/commit/c1b9343c), [26c70a3f](https://github.com/Dicklesworthstone/beads_rust/commit/26c70a3f), [#517](https://github.com/Dicklesworthstone/beads_rust/issues/517)).
+- Unknown or misspelled keys in `policy.yaml`, including keys inside
+  `workflow.gates` rules and gate specs, are printed as a warning at default
+  verbosity and reported by the new `br doctor` check `policy.unknown_keys`;
+  before, a typo silently disabled its rule
+  ([e3bc097f](https://github.com/Dicklesworthstone/beads_rust/commit/e3bc097f), [565b43c8](https://github.com/Dicklesworthstone/beads_rust/commit/565b43c8), [43723cef](https://github.com/Dicklesworthstone/beads_rust/commit/43723cef), [#515](https://github.com/Dicklesworthstone/beads_rust/issues/515)).
+- `br update --help` no longer shows an internal code note
+  ([e8d84754](https://github.com/Dicklesworthstone/beads_rust/commit/e8d84754), [#516](https://github.com/Dicklesworthstone/beads_rust/issues/516)).
+- `br version` reports the commit the binary was actually built from after a
+  commit or pull ([5e3c6711](https://github.com/Dicklesworthstone/beads_rust/commit/5e3c6711), [#514](https://github.com/Dicklesworthstone/beads_rust/issues/514)).
+- Lockfile refresh: `thiserror` and `rand` minor updates
+  ([06582ba0](https://github.com/Dicklesworthstone/beads_rust/commit/06582ba0)).
+
+## v0.7.0 — 2026-09-24
+
+[Release](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.7.0).
+A minor version because the storage engine moves to a new FrankenSQLite
+generation (0.3.18 → 0.4.4), the minimum Rust version rises to 1.89, and JSONL
+import now refuses some inputs it used to accept (below). The database schema
+is unchanged at 19, so no `doctor migrate-schema` step is needed from 0.6.0.
+
+### Behaviour changes to know before upgrading
+
+- **Import refuses an id that names a different issue.** Previously
+  `br sync --import-only` (and auto-import) resolved a JSONL row by id with
+  last-write-wins, so when two clones had minted the same id — typically a
+  child id `<parent>.N`, which comes from each database's own counter — one
+  of the two issues was silently replaced. A JSONL row whose id is held
+  locally by an issue with a **different `created_at`** is now treated as a
+  different issue: the import is refused with an `ID collision` error that
+  points at `br sync --merge`. The one accepted case is the merged ledger
+  coming back (the JSONL carries the unchanged local issue under another id).
+  A relocated issue is also no longer folded back onto its old id through a
+  content-hash match. Because ordinary commands auto-import, reads such as
+  `br show`, `br list` and `br ready` report the same `ID collision`
+  (`SYNC_CONFLICT`, exit 6) while the colliding JSONL is present, until
+  `br sync --merge` has run; `--no-auto-import` still reads the local
+  database. Tooling that rewrites JSONL rows and changes
+  `created_at` for an existing id will now hit this refusal; keep
+  `created_at` stable for the life of an issue
+  ([583807e6](https://github.com/Dicklesworthstone/beads_rust/commit/583807e6), [#512](https://github.com/Dicklesworthstone/beads_rust/issues/512)).
+- **`br sync --merge` keeps both issues on an id collision.** A different
+  `created_at` under one id now means two issues. The earlier-created issue
+  keeps the id; the other is re-keyed, with its labels, dependencies and
+  comments, to the next free child number (or a fresh hash id for a root id),
+  and references from its own side follow it. The choice depends only on the
+  merged data, so clones converge on the same ids, including when three or
+  more clones resolved the collisions in different orders. Every collision is
+  reported as an `ID collision` warning on stderr and in `id_collisions` in
+  `--json`; one that cannot be re-keyed stays a conflict under every
+  strategy. Comments are append-only, so comment sets are now unioned by sync
+  identity instead of one side's list winning, and comment-only divergence is
+  no longer a conflict ([583807e6](https://github.com/Dicklesworthstone/beads_rust/commit/583807e6), [63e908aa](https://github.com/Dicklesworthstone/beads_rust/commit/63e908aa), [#512](https://github.com/Dicklesworthstone/beads_rust/issues/512)).
+- **`br sync --merge` refuses an empty JSONL.** A JSONL with no issues (a
+  truncated file, an empty checkout) was read as the other side deleting
+  everything, and every issue shared with the last sync was deleted under
+  every strategy. The merge now refuses unless `--force-jsonl` explicitly
+  accepts the deletion, and points at restoring the file or
+  `br sync --flush-only --force` ([63e908aa](https://github.com/Dicklesworthstone/beads_rust/commit/63e908aa)).
+- **Minimum supported Rust is 1.89** for source builds ([4fafa4e7](https://github.com/Dicklesworthstone/beads_rust/commit/4fafa4e7)).
+
+### Concurrent edits and agent-facing output
+
+- `br update --if-unchanged <UPDATED_AT>` makes a read-modify-write
+  conditional: if the issue's `updated_at` has moved since the caller read
+  it, nothing is written and the command exits 6 naming both timestamps.
+  Label, parent and checklist edits are covered too. Without the flag,
+  behaviour is unchanged ([f2b3cec9](https://github.com/Dicklesworthstone/beads_rust/commit/f2b3cec9), [4f08338d](https://github.com/Dicklesworthstone/beads_rust/commit/4f08338d), [#500](https://github.com/Dicklesworthstone/beads_rust/issues/500)). The MCP
+  `update_issue` tool takes the same precondition as `if_unchanged`
+  ([314ae3e3](https://github.com/Dicklesworthstone/beads_rust/commit/314ae3e3), [#505](https://github.com/Dicklesworthstone/beads_rust/issues/505)).
+- `br ready --brief` omits long text fields from JSON/TOON output so an agent
+  can choose work without loading every description ([e4a24098](https://github.com/Dicklesworthstone/beads_rust/commit/e4a24098)).
+- `br list --fields` and `br search --fields` select JSON/TOON fields without
+  changing which issues match, their order or page metadata; unknown or empty
+  selectors are refused ([51f7fe5b](https://github.com/Dicklesworthstone/beads_rust/commit/51f7fe5b), [597ffd0a](https://github.com/Dicklesworthstone/beads_rust/commit/597ffd0a)).
+- `br search` matches non-ASCII queries case-insensitively across ids,
+  titles, descriptions and comment history *before* pagination and
+  hidden-history counts; supplied text filters stay mandatory, and priority
+  ranges parse like `list`/`ready` ([8370be25](https://github.com/Dicklesworthstone/beads_rust/commit/8370be25), [0724b3f9](https://github.com/Dicklesworthstone/beads_rust/commit/0724b3f9)). Searches
+  over the whole corpus no longer re-scan comments once per issue
+  ([86b4b641](https://github.com/Dicklesworthstone/beads_rust/commit/86b4b641)).
+- `br lint` reads the `acceptance_criteria` field, and legacy description
+  sections must be real headings with non-empty bodies ([3e5ca281](https://github.com/Dicklesworthstone/beads_rust/commit/3e5ca281),
+  [#509](https://github.com/Dicklesworthstone/beads_rust/issues/509)). The rich-output tip recommends `--acceptance-criteria` only for a
+  missing Acceptance Criteria section, not for an epic's Success Criteria or a
+  bug's Steps to Reproduce ([a361c855](https://github.com/Dicklesworthstone/beads_rust/commit/a361c855), [#511](https://github.com/Dicklesworthstone/beads_rust/issues/511)).
+- Acceptance-checklist edits and `prerequisites_complete` ignore checkboxes
+  inside fenced code examples ([45038719](https://github.com/Dicklesworthstone/beads_rust/commit/45038719)).
+- A `require_if` gate that raises `min_reviewers` above the base
+  `require_all` threshold now takes the higher threshold instead of the first
+  one listed ([65f3dfa2](https://github.com/Dicklesworthstone/beads_rust/commit/65f3dfa2),
+  [#513](https://github.com/Dicklesworthstone/beads_rust/issues/513)).
+- A policy refusal now names `workflow.required_fields` and its
+  presence-only variant, and marks the bypass flags as `br close`-only
+  ([b02a4453](https://github.com/Dicklesworthstone/beads_rust/commit/b02a4453)).
+- `br doctor --repair` writes the same canonical `.beads/.gitignore` as
+  `br init` when the file is missing ([71a39f0f](https://github.com/Dicklesworthstone/beads_rust/commit/71a39f0f), [#501](https://github.com/Dicklesworthstone/beads_rust/issues/501)).
+
+### Storage recovery and maintenance
+
+- A torn WAL sidecar (shorter than its 32-byte header, as a crash can leave
+  it) no longer locks the workspace. Such a WAL cannot hold a committed
+  frame, so schema preflight treats it as empty, as SQLite does, and startup
+  moves it and its shared index into `.br_recovery/` under database-family
+  authority, as the sole opener, with a `torn_wal_quarantined` warning. Empty
+  and complete header-only WALs are untouched. Pre-release builds with the
+  new startup index recovery refused every command on such a WAL.
+- A refused automatic WAL-index recovery keeps one retained pre-state per
+  incident. Repeating a command over the same byte-identical database family
+  now reports the retained copy instead of copying the whole family into a
+  new `.br_recovery` run each time; `br doctor migrate-schema recover` still
+  retries explicitly.
+- A poisoned WAL shared index (initialized header, zero page size) next to a
+  live WAL is diagnosed by `doctor`, routed to
+  `br doctor migrate-schema recover`, and recovered automatically by writable
+  commands under database-family authority and sole-opener admission.
+  Read-only commands stay byte-neutral ([fe191201](https://github.com/Dicklesworthstone/beads_rust/commit/fe191201), [4c6a1383](https://github.com/Dicklesworthstone/beads_rust/commit/4c6a1383),
+  [c5229b59](https://github.com/Dicklesworthstone/beads_rust/commit/c5229b59), [#507](https://github.com/Dicklesworthstone/beads_rust/issues/507)).
+- Schema migration, post-import compaction and doctor's page-corruption
+  repair run VACUUM only on a private copy under `.br_recovery`; the live
+  database family is untouched until the attested atomic install
+  ([7447f1fb](https://github.com/Dicklesworthstone/beads_rust/commit/7447f1fb), [52affd1a](https://github.com/Dicklesworthstone/beads_rust/commit/52affd1a), [de1e863e](https://github.com/Dicklesworthstone/beads_rust/commit/de1e863e), [#507](https://github.com/Dicklesworthstone/beads_rust/issues/507)).
+- Compaction refuses a checkpoint that reports busy or partial backfill
+  instead of treating it as complete, and a failed multi-statement SQL batch
+  is never replayed automatically ([3f29531d](https://github.com/Dicklesworthstone/beads_rust/commit/3f29531d), [efeec0b0](https://github.com/Dicklesworthstone/beads_rust/commit/efeec0b0),
+  [41df183e](https://github.com/Dicklesworthstone/beads_rust/commit/41df183e), [#508](https://github.com/Dicklesworthstone/beads_rust/issues/508)).
+
+### Distribution and verification
+
+- Seven default-feature binaries were built with dsr from
+  [2fbc2b7e](https://github.com/Dicklesworthstone/beads_rust/commit/2fbc2b7e):
+  Linux GNU (glibc 2.28 floor, cargo-zigbuild) and static musl on amd64/arm64,
+  macOS amd64/arm64, and Windows amd64 using the GNU toolchain. The MSVC
+  build overflowed its 1 MiB main-thread stack on `br dep add`; the GNU
+  build reserves 2 MiB, as v0.6.0 did. A fleet-wide `/.cargo/config.toml`
+  kept dsr from staging builds on the Linux hosts, so the Linux and Windows
+  targets were cross-built on Apple Silicon. GitHub Actions were not used.
+- The 24 assets are seven archives, seven SHA-256 sidecars, seven Minisign
+  signatures (key `36B847D11BA5A0D0`), aggregate checksums, and SPDX/CycloneDX
+  source SBOMs. Draft and unauthenticated public downloads matched the staged
+  bytes, checksums and signatures. Every archived binary reports commit
+  2fbc2b7e and passed a create/sync/clone round trip plus the #512 collision
+  and empty-JSONL refusals, on native Linux amd64, macOS arm64 and Intel
+  (Rosetta), Windows, and arm64 Linux under qemu-user. The public installer
+  installed byte-identical binaries on Linux amd64 and Apple Silicon.
+- The [crates.io package](https://crates.io/crates/beads_rust/0.7.0) was
+  published from the tagged tree after its verification build; the registry
+  checksum is `68f6685c7a35aac49ab65179afb5cd077917eedde22f24c569bfe7d8025decb8`.
+  Homebrew and Scoop point at the v0.7.0 assets, `br upgrade` moved a 0.6.0
+  Linux binary to the published 0.7.0 bytes, and AUR publication remains
+  blocked on credentials as for v0.6.0.
+- The full test suite at 2fbc2b7e passed as a non-root user on Linux: 26,716
+  passed, 0 failed, 115 existing ignores. Clippy with `-D warnings` passed for
+  default and all features.
+
+### Storage engine, startup and dependencies
+
+- **Restore concurrent startup with the published storage engine.** The whole
+  FrankenSQLite family moves to the published 0.4.4 release, with Asupersync
+  0.5.0 ([f78c8fe0](https://github.com/Dicklesworthstone/beads_rust/commit/f78c8fe0)).
   Read-only WAL admission now avoids the exclusive maintenance conflict that
   could stall CLI reads and refuse MCP startup during pending-sync inspection.
   The existing br opener leases and checkpoint containment remain in force.

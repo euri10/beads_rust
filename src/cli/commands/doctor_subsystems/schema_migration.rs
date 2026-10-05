@@ -265,10 +265,10 @@ struct PlanTokenMaterial<'a> {
     forecast: &'a MigrationForecast,
 }
 
-struct MigrationContext {
-    beads_dir: PathBuf,
-    db_path: PathBuf,
-    write_authority: Arc<DatabaseFamilyWriteLock>,
+pub(super) struct MigrationContext {
+    pub(super) beads_dir: PathBuf,
+    pub(super) db_path: PathBuf,
+    pub(super) write_authority: Arc<DatabaseFamilyWriteLock>,
 }
 
 /// Execute `br doctor migrate-schema ...`.
@@ -288,6 +288,12 @@ pub fn execute(
         DoctorMigrateSchemaCommand::Plan(plan) => execute_plan(plan, &migration),
         DoctorMigrateSchemaCommand::Apply(apply) => execute_apply(apply, &migration),
         DoctorMigrateSchemaCommand::Undo(undo) => execute_undo(undo, &migration),
+        DoctorMigrateSchemaCommand::Heal(heal) => super::schema_heal::execute_heal(
+            heal,
+            cli,
+            &migration.beads_dir,
+            &migration.write_authority,
+        ),
     }
 }
 
@@ -328,11 +334,92 @@ struct EngineRecoveryReceipt {
     schema_version: &'static str,
     database_path: String,
     backup_path: String,
+    /// What `backup_path` holds: the complete family, or only the WAL index
+    /// when that was all recovery had to rebuild (see
+    /// `index_only_recovery_applies`).
+    backup_scope: &'static str,
     stage: String,
     raw_before: RawFamilyWitness,
     raw_after: Option<RawFamilyWitness>,
     logical_after: Option<LogicalDatabaseWitness>,
+    /// Set when the database already had corrupt secondary indexes: the
+    /// recovered family is byte-for-byte the durable pre-state, and a private
+    /// rehearsal proved `br doctor --repair-indexes` clears it (GH #523).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    index_corruption: Option<IndexCorruptionFinding>,
     error: Option<String>,
+}
+
+/// Integrity damage that predates WAL-index recovery and that rebuilding the
+/// user indexes repairs without changing the schema or any row (GH #523).
+#[derive(Debug, Clone, Serialize)]
+struct IndexCorruptionFinding {
+    /// `PRAGMA integrity_check` output of the recovered family.
+    integrity_check: String,
+    /// The command that repairs it.
+    remediation: &'static str,
+    /// The diagnostics show index entries whose table row is missing. The
+    /// rebuild cannot tell a stale index entry from a row lost out of its
+    /// table: it drops the entry either way, so the operator should check
+    /// the JSONL export for the missing records first.
+    index_entries_without_table_rows: bool,
+}
+
+impl IndexCorruptionFinding {
+    const REMEDIATION: &'static str = "br doctor --repair-indexes";
+
+    /// One-line summary for operator-facing messages.
+    fn summary(&self) -> String {
+        integrity_summary(&self.integrity_check)
+    }
+
+    /// Operator warning for [`Self::index_entries_without_table_rows`].
+    const MISSING_ROWS_WARNING: &'static str = "Some index entries point at rows that are \
+         missing from their table, so rows may have been lost from the table itself; \
+         rebuilding the indexes drops those entries. Before running it, check issues.jsonl for \
+         the missing records (the complete pre-recovery family is retained).";
+}
+
+/// Whether integrity diagnostics report index entries that have no table
+/// row: an index with more entries than its table requires, or a stale
+/// rowid. Rebuilding the indexes makes them agree with the table, so these
+/// entries are the only evidence of a row lost from the table (GH #523).
+fn integrity_reports_index_entries_without_table_rows(integrity_check: &str) -> bool {
+    integrity_check.lines().any(|line| {
+        let lower = line.to_ascii_lowercase();
+        if lower.contains("no matching table row") {
+            return true;
+        }
+        // "index `i` contains N entries but table `t` requires exactly M"
+        let count_after = |marker: &str| {
+            lower.find(marker).and_then(|start| {
+                lower[start + marker.len()..]
+                    .split_whitespace()
+                    .next()
+                    .and_then(|number| number.parse::<u64>().ok())
+            })
+        };
+        matches!(
+            (count_after(" contains "), count_after(" requires exactly ")),
+            (Some(entries), Some(required)) if entries > required
+        )
+    })
+}
+
+/// What WAL-index recovery does when the recovered family's integrity check
+/// fails only because of secondary-index damage that predates the recovery
+/// (GH #523). Damage anywhere else always fails recovery closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreexistingIndexCorruption {
+    /// Leave the live family untouched and fail naming the recovery path.
+    /// Automatic startup recovery uses this, so ordinary commands never run
+    /// against indexes known to be broken.
+    Refuse,
+    /// Restore engine admission (the durable bytes are unchanged) and report
+    /// the damage in the receipt. Explicit `migrate-schema recover` uses
+    /// this, so the damage can never lock the operator out of
+    /// `br doctor --repair-indexes`, which needs an admitted engine.
+    Admit,
 }
 
 /// Recovery is deliberately explicit: planning must never bootstrap a writer.
@@ -342,7 +429,8 @@ fn execute_recover(
     args: &DoctorMigrateSchemaRecoverArgs,
     migration: &MigrationContext,
 ) -> Result<()> {
-    let receipt = recover_engine_admission_with_lease(migration, false)?;
+    let receipt =
+        recover_engine_admission_with_lease(migration, false, PreexistingIndexCorruption::Admit)?;
     if args.json {
         println!("{}", serde_json::to_string_pretty(&receipt)?);
     } else {
@@ -350,26 +438,190 @@ fn execute_recover(
             "Recovered engine read admission for {}",
             receipt.database_path
         );
-        println!("Pre-recovery family retained at {}", receipt.backup_path);
-        println!("Run `br doctor migrate-schema plan` to review the schema migration.");
+        if receipt.backup_scope == RECOVERY_BACKUP_WAL_INDEX_ONLY {
+            println!(
+                "Only the WAL index needed rebuilding; the main database and WAL were unchanged. \
+                 Pre-recovery index retained at {}",
+                receipt.backup_path
+            );
+        } else {
+            println!("Pre-recovery family retained at {}", receipt.backup_path);
+        }
+        if let Some(finding) = &receipt.index_corruption {
+            println!(
+                "The database already had corrupt indexes ({}). A private rehearsal showed that \
+                 rebuilding them repairs it without changing any row. Run `{}` next; it keeps a \
+                 pre-repair snapshot.",
+                finding.summary(),
+                finding.remediation
+            );
+            if finding.index_entries_without_table_rows {
+                println!("{}", IndexCorruptionFinding::MISSING_ROWS_WARNING);
+            }
+        } else {
+            println!("Run `br doctor migrate-schema plan` to review the schema migration.");
+        }
     }
     Ok(())
 }
 
+/// Bytes in a SQLite WAL header. A WAL shorter than this cannot hold a frame.
+const WAL_HEADER_BYTES: u64 = 32;
+
 /// Whether an existing WAL family lacks its regenerable shared index.
 /// This is only an advisory probe; recovery repeats it under family authority.
+///
+/// A torn WAL (shorter than its header) is not an index-recovery case: it holds
+/// no frames, so there is no index to rebuild. [`torn_wal_present`] and
+/// [`quarantine_torn_wal_for_startup`] handle it instead.
 ///
 /// # Errors
 /// Returns an error for unsafe paths or failed filesystem inspection.
 pub fn missing_wal_index(db_path: &Path) -> Result<bool> {
-    if secure_file_metadata(db_path)?.is_none()
+    missing_wal_index_for_engine(
+        db_path,
+        crate::franken_sync::wal_index::STARTUP_WAL_INDEX_RECOVERY,
+    )
+}
+
+/// [`missing_wal_index`] for an engine that does (or does not) read the
+/// on-disk index. An engine that rebuilds its index privately on every open
+/// never needs the file, so its absence is not a recovery case (GH #520).
+fn missing_wal_index_for_engine(db_path: &Path, engine_reads_on_disk_index: bool) -> Result<bool> {
+    if !engine_reads_on_disk_index
+        || secure_file_metadata(db_path)?.is_none()
         || secure_file_metadata(&family_component_path(db_path, "-shm"))?.is_some()
     {
         return Ok(false);
     }
     Ok(
         secure_file_metadata(&family_component_path(db_path, "-wal"))?
-            .is_some_and(|metadata| metadata.len() > 0),
+            .is_some_and(|metadata| metadata.len() >= WAL_HEADER_BYTES),
+    )
+}
+
+/// Whether the live WAL is torn: present, non-empty, and shorter than its
+/// 32-byte header. SQLite reads such a WAL as containing no frames (a crash
+/// before the header was fully written), so the main database file alone is
+/// the complete committed state. An empty WAL is the normal post-truncate
+/// state and is not torn.
+///
+/// # Errors
+/// Returns an error for unsafe paths or failed filesystem inspection.
+pub fn torn_wal_present(db_path: &Path) -> Result<bool> {
+    if secure_file_metadata(db_path)?.is_none() {
+        return Ok(false);
+    }
+    Ok(
+        secure_file_metadata(&family_component_path(db_path, "-wal"))?
+            .is_some_and(|metadata| is_torn_wal_length(metadata.len())),
+    )
+}
+
+const fn is_torn_wal_length(length: u64) -> bool {
+    length > 0 && length < WAL_HEADER_BYTES
+}
+
+/// A torn WAL moved out of the live family by [`quarantine_torn_wal_for_startup`].
+#[derive(Debug, Clone)]
+pub struct TornWalQuarantine {
+    /// Size of the torn WAL, always below the 32-byte header size.
+    pub wal_length: u64,
+    /// Where the WAL (and its shared index, if one existed) now live.
+    pub quarantined_paths: Vec<PathBuf>,
+}
+
+/// Move a torn WAL, and the shared index that described it, out of the live
+/// database family before startup opens the database.
+///
+/// A WAL shorter than its header holds no committed frame, so nothing is lost:
+/// the engine recreates both sidecars on the next write. The original bytes are
+/// kept under `.br_recovery/` rather than deleted. This runs only under the
+/// held database-family write authority and only as the verified sole opener;
+/// with live peers it leaves the family untouched and returns `None`, so a
+/// torn WAL can never lock the workspace by itself.
+///
+/// # Errors
+/// Refuses mismatched authority, unsafe paths, or a failed verified rename.
+pub fn quarantine_torn_wal_for_startup(
+    beads_dir: &Path,
+    db_path: &Path,
+    authority: &Arc<DatabaseFamilyWriteLock>,
+) -> Result<Option<TornWalQuarantine>> {
+    if crate::sync::database_write_authority_sha256(db_path)? != authority.authority_path_sha256() {
+        return Err(BeadsError::SyncConflict {
+            message: "Torn WAL quarantine path does not match the held database-family authority"
+                .to_string(),
+        });
+    }
+    authority.verify_database_authority()?;
+    if !torn_wal_present(db_path)? {
+        return Ok(None);
+    }
+    let mut lease = crate::sync::DatabaseOpenerLease::register(db_path)?;
+    let Some(exclusive) = lease.try_exclusive() else {
+        return Ok(None);
+    };
+    let result = (|| -> Result<Option<TornWalQuarantine>> {
+        authority.verify_database_authority()?;
+        let wal_path = family_component_path(db_path, "-wal");
+        // Re-read under sole-opener admission: a peer may have finished
+        // writing the header between the advisory probe and the lease.
+        let Some(metadata) = secure_file_metadata(&wal_path)? else {
+            return Ok(None);
+        };
+        let wal_length = metadata.len();
+        if !is_torn_wal_length(wal_length) {
+            return Ok(None);
+        }
+        let quarantined_paths = config::quarantine_database_artifacts(
+            db_path,
+            beads_dir,
+            [wal_path, family_component_path(db_path, "-shm")],
+            "truncated-wal",
+        )?;
+        authority.verify_database_authority()?;
+        Ok(Some(TornWalQuarantine {
+            wal_length,
+            quarantined_paths,
+        }))
+    })();
+    let released = lease.release_exclusive(exclusive);
+    result.and_then(|quarantine| released.map(|()| quarantine))
+}
+
+/// Whether the derived WAL index must be recovered before the engine can be
+/// trusted to admit this family. Always false where the engine never reads
+/// the on-disk index (Windows): there is nothing to recover, and attempting it
+/// would wedge every command on an unsupported quarantine (GH #520).
+/// Also false on Unix targets without the quarantine primitive, where
+/// entering recovery could only fail as unsupported.
+///
+/// # Errors
+/// Returns an error for unsafe paths or failed filesystem inspection.
+pub fn wal_index_needs_recovery(db_path: &Path) -> Result<bool> {
+    wal_index_needs_recovery_for_engine(
+        db_path,
+        crate::franken_sync::wal_index::STARTUP_WAL_INDEX_RECOVERY,
+    )
+}
+
+fn wal_index_needs_recovery_for_engine(
+    db_path: &Path,
+    engine_reads_on_disk_index: bool,
+) -> Result<bool> {
+    Ok(
+        missing_wal_index_for_engine(db_path, engine_reads_on_disk_index)?
+            || crate::franken_sync::wal_index::poisoned_index_present_for_engine(
+                db_path,
+                engine_reads_on_disk_index,
+            )?
+            // An index left by an engine that never maintained it (br 0.6.0),
+            // or one describing another WAL generation (GH #521).
+            || crate::franken_sync::wal_index::stale_index_present_for_engine(
+                db_path,
+                engine_reads_on_disk_index,
+            )?,
     )
 }
 
@@ -379,7 +631,7 @@ pub fn missing_wal_index(db_path: &Path) -> Result<bool> {
 /// # Errors
 /// Refuses changed authority, peer openers, invalid WALs, or recovery whose
 /// durable bytes and logical contents cannot be verified unchanged.
-pub fn recover_missing_wal_index(
+pub fn recover_wal_index_for_startup(
     beads_dir: &Path,
     db_path: &Path,
     authority: &Arc<DatabaseFamilyWriteLock>,
@@ -391,21 +643,86 @@ pub fn recover_missing_wal_index(
         });
     }
     authority.verify_database_authority()?;
-    if !missing_wal_index(db_path)? {
+    if !wal_index_needs_recovery(db_path)? {
         return Ok(());
+    }
+    // Every automatic attempt retains its pre-state in a new `.br_recovery`
+    // run (the complete family, unless only the index had to be rebuilt).
+    // Recovery over identical bytes is deterministic, so once it has failed
+    // for this exact family, repeating it on every command only accumulates
+    // copies. Keep one snapshot per incident and report the retained one.
+    let raw_before = recovery_family_witness(db_path)?;
+    if let Some(prior) = prior_failed_recovery(beads_dir, &raw_before)? {
+        return Err(BeadsError::SyncConflict {
+            message: format!(
+                "automatic WAL index recovery already failed for this exact database family \
+                 at stage {} ({}); its pre-recovery state is retained at {}. The database was \
+                 not copied again. Run `br doctor migrate-schema recover` to retry explicitly, \
+                 or `br doctor` for diagnosis.",
+                prior.stage,
+                prior.error.as_deref().unwrap_or("no recorded error"),
+                prior.backup_path
+            ),
+        });
     }
     let migration = MigrationContext {
         beads_dir: beads_dir.to_path_buf(),
         db_path: db_path.to_path_buf(),
         write_authority: Arc::clone(authority),
     };
-    recover_engine_admission_with_lease(&migration, true)?;
+    recover_engine_admission_with_lease(&migration, true, PreexistingIndexCorruption::Refuse)?;
     Ok(())
+}
+
+/// The fields of a `recovery-failed.json` receipt that identify its incident.
+#[derive(Debug, Deserialize)]
+struct PriorRecoveryFailure {
+    backup_path: String,
+    stage: String,
+    raw_before: RawFamilyWitness,
+    error: Option<String>,
+}
+
+/// Find an earlier failed recovery run whose pre-state is byte-identical
+/// (same components, lengths, SHA-256 digests and modes) to `raw_before`.
+fn prior_failed_recovery(
+    beads_dir: &Path,
+    raw_before: &RawFamilyWitness,
+) -> Result<Option<PriorRecoveryFailure>> {
+    let root = migration_runs_root(beads_dir);
+    let entries = match fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        // Runs are directories; anything else in the root is not a receipt.
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let receipt_path = entry.path().join("recovery-failed.json");
+        let bytes = match fs::read(&receipt_path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        // A receipt this binary cannot parse is not evidence of the same
+        // incident; ignore it rather than blocking recovery on it.
+        let Ok(prior) = serde_json::from_slice::<PriorRecoveryFailure>(&bytes) else {
+            continue;
+        };
+        if &prior.raw_before == raw_before {
+            return Ok(Some(prior));
+        }
+    }
+    Ok(None)
 }
 
 fn recover_engine_admission_with_lease(
     migration: &MigrationContext,
     strict_wal: bool,
+    policy: PreexistingIndexCorruption,
 ) -> Result<EngineRecoveryReceipt> {
     let mut lease = crate::sync::DatabaseOpenerLease::register(&migration.db_path)?;
     let exclusive = lease
@@ -415,7 +732,7 @@ fn recover_engine_admission_with_lease(
                 "engine recovery requires a verified sole opener; close peer br processes and retry"
                     .to_string(),
         })?;
-    let result = recover_engine_admission(migration, strict_wal);
+    let result = recover_engine_admission(migration, strict_wal, policy);
     let released = lease.release_exclusive(exclusive);
     result.and_then(|receipt| released.map(|()| receipt))
 }
@@ -475,7 +792,405 @@ fn recover_existing_family(path: &Path, authority: Option<&DatabaseFamilyWriteLo
 fn recover_engine_admission(
     migration: &MigrationContext,
     strict_wal: bool,
+    policy: PreexistingIndexCorruption,
 ) -> Result<EngineRecoveryReceipt> {
+    migration.write_authority.verify_database_authority()?;
+    refuse_non_regular_component(&migration.db_path)?;
+    let raw_before = recovery_family_witness(&migration.db_path)?;
+    let (receipt, run_dir) = if index_only_recovery_applies(&migration.db_path, &raw_before)? {
+        match recover_index_only(migration, &raw_before)? {
+            Some(completed) => completed,
+            None => recover_engine_admission_with_complete_backup(migration, strict_wal, policy)?,
+        }
+    } else {
+        recover_engine_admission_with_complete_backup(migration, strict_wal, policy)?
+    };
+    // Only a completed recovery prunes: a failed or interrupted one must not
+    // lose older evidence on its way out.
+    match prune_recovery_runs(
+        &migration.beads_dir,
+        &migration.db_path,
+        &run_dir,
+        Utc::now(),
+    ) {
+        Ok(pruned) if !pruned.is_empty() => tracing::info!(
+            pruned = pruned.len(),
+            kept_recent = RECOVERY_RUNS_KEPT,
+            "pruned completed WAL-index recovery runs past the retention window"
+        ),
+        Ok(_) => {}
+        Err(error) => tracing::warn!(
+            %error,
+            "could not prune old WAL-index recovery runs; they are kept"
+        ),
+    }
+    // The same rule for the `.br-wal-index-*` directories each quarantine of
+    // a poisoned index leaves beside the database.
+    match recovery_failure_receipts(&migration.beads_dir).and_then(|failures| {
+        crate::franken_sync::wal_index::prune_quarantined_indexes(
+            &migration.db_path,
+            RECOVERY_RUNS_KEPT,
+            std::time::Duration::from_secs(
+                u64::try_from(RECOVERY_RUN_MIN_AGE_DAYS).unwrap_or(7) * 24 * 60 * 60,
+            ),
+            std::time::SystemTime::now(),
+            &failures,
+        )
+        .map_err(BeadsError::Io)
+    }) {
+        Ok(pruned) if !pruned.is_empty() => tracing::info!(
+            pruned = pruned.len(),
+            kept_recent = RECOVERY_RUNS_KEPT,
+            "pruned completed WAL-index quarantines past the retention window"
+        ),
+        Ok(_) => {}
+        Err(error) => tracing::warn!(
+            %error,
+            "could not prune old WAL-index quarantines; they are kept"
+        ),
+    }
+    Ok(receipt)
+}
+
+/// The text of every `recovery-failed.json` under the recovery runs root. A
+/// failed quarantine's error names the directory it retained, which keeps
+/// that directory out of [`prune_quarantined_indexes`]'s reach.
+///
+/// [`prune_quarantined_indexes`]: crate::franken_sync::wal_index::prune_quarantined_indexes
+fn recovery_failure_receipts(beads_dir: &Path) -> Result<Vec<String>> {
+    let root = migration_runs_root(beads_dir);
+    let entries = match fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(BeadsError::Io(error)),
+    };
+    let mut receipts = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(BeadsError::Io)?;
+        match fs::read(entry.path().join("recovery-failed.json")) {
+            Ok(bytes) => receipts.push(String::from_utf8_lossy(&bytes).into_owned()),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) => {}
+            Err(error) => return Err(BeadsError::Io(error)),
+        }
+    }
+    Ok(receipts)
+}
+
+/// How many of a database's newest WAL-index recovery runs are always kept.
+const RECOVERY_RUNS_KEPT: usize = 5;
+/// Completed recovery runs younger than this are always kept.
+const RECOVERY_RUN_MIN_AGE_DAYS: i64 = 7;
+/// Backup scope of a recovery run that copied the whole database family.
+const RECOVERY_BACKUP_COMPLETE_FAMILY: &str = "complete-family";
+/// Backup scope of a recovery run that only had to rebuild the WAL index.
+const RECOVERY_BACKUP_WAL_INDEX_ONLY: &str = "wal-index-only";
+/// Marker for an index-only run that handed over to the complete-backup
+/// rehearsal: its only copy is the index it reinstated first.
+const RECOVERY_SUPERSEDED_RECEIPT: &str = "recovery-superseded.json";
+/// Prefix a run directory is renamed to before it is removed, so a removal
+/// that stops halfway never leaves something that looks like a live run.
+const PRUNING_PREFIX: &str = ".pruning-";
+
+/// Whether recovery only has to rebuild the WAL index: the index has the
+/// zero-page shape stock SQLite leaves on a family whose WAL holds no frames
+/// (#507), the WAL is its bare 32-byte header, and there is no rollback
+/// journal. The main database file is then the entire committed state, and
+/// rebuilding the index cannot change it, so copying the whole family (twice:
+/// backup and private rehearsal) on every such recovery bought nothing but
+/// disk use. That happened after every stock SQLite read of the tracker (bv,
+/// the sqlite3 shell).
+fn index_only_recovery_applies(db_path: &Path, raw_before: &RawFamilyWitness) -> Result<bool> {
+    let wal = component_for_suffix(raw_before, "-wal")?;
+    let shm = component_for_suffix(raw_before, "-shm")?;
+    let journal = component_for_suffix(raw_before, "-journal")?;
+    if !(wal.present && wal.length == Some(WAL_HEADER_BYTES) && shm.present && !journal.present) {
+        return Ok(false);
+    }
+    Ok(crate::franken_sync::wal_index::poisoned_index_present(
+        db_path,
+    )?)
+}
+
+/// Rebuild a #507 zero-page index in place, keeping only that index as the
+/// pre-state. Main database, WAL and journal must come out byte-identical,
+/// which is checked, and the result must pass a full integrity check.
+///
+/// Returns the completed receipt and its run directory. Returns `None` when
+/// the integrity check fails: the database had damage before this recovery,
+/// so the original index is reinstated, byte for byte, and the caller runs
+/// the complete-backup rehearsal, which classifies and reports it exactly as
+/// before.
+fn recover_index_only(
+    migration: &MigrationContext,
+    raw_before: &RawFamilyWitness,
+) -> Result<Option<(EngineRecoveryReceipt, PathBuf)>> {
+    let db_path = &migration.db_path;
+    let shm_witness = component_for_suffix(raw_before, "-shm")?.clone();
+    let run_id = allocate_run_id(&migration.beads_dir)?;
+    let run_dir = migration_runs_root(&migration.beads_dir).join(run_id);
+    let before_dir = run_dir.join("recovery-before");
+    ensure_new_directory(&before_dir)?;
+    let index_backup = backup_component_path(&before_dir, db_path, "-shm")?;
+    copy_regular_file_new(&family_component_path(db_path, "-shm"), &index_backup, None)?;
+    sync_directory(&before_dir)?;
+    verify_retained_component(&index_backup, &shm_witness)?;
+    let mut receipt = EngineRecoveryReceipt {
+        schema_version: "br.doctor.schema_migration.recovery.v1",
+        database_path: db_path.display().to_string(),
+        backup_path: before_dir.display().to_string(),
+        backup_scope: RECOVERY_BACKUP_WAL_INDEX_ONLY,
+        stage: "live-preflight".to_string(),
+        raw_before: raw_before.clone(),
+        raw_after: None,
+        logical_after: None,
+        index_corruption: None,
+        error: None,
+    };
+    write_json_new(&run_dir.join("recovery-prepared.json"), &receipt)?;
+    let operation = (|| -> Result<bool> {
+        migration.write_authority.verify_database_authority()?;
+        if recovery_family_witness(db_path)? != receipt.raw_before {
+            return Err(BeadsError::internal(
+                "database family changed before WAL index recovery",
+            ));
+        }
+        receipt.stage = "live-recovery".to_string();
+        recover_existing_family(db_path, Some(&migration.write_authority))?;
+        migration.write_authority.verify_database_authority()?;
+        let raw_after = recovery_family_witness(db_path)?;
+        require_recovery_payload_unchanged(&receipt.raw_before, &raw_after)?;
+        receipt.raw_after = Some(raw_after);
+        let logical_after = logical_witness(db_path)?;
+        let clean = integrity_check_is_clean(&logical_after.integrity_check);
+        receipt.logical_after = Some(logical_after);
+        if clean {
+            receipt.stage = "complete".to_string();
+            return Ok(true);
+        }
+        receipt.stage = "reinstate-index".to_string();
+        reinstate_retained_index(db_path, &index_backup, &shm_witness)?;
+        migration.write_authority.verify_database_authority()?;
+        let reinstated = recovery_family_witness(db_path)?;
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            if component_for_suffix(&reinstated, suffix)?
+                != component_for_suffix(&receipt.raw_before, suffix)?
+            {
+                return Err(BeadsError::internal(format!(
+                    "reinstating the original WAL index left component {suffix:?} different \
+                     from the pre-recovery state"
+                )));
+            }
+        }
+        receipt.stage = "superseded".to_string();
+        Ok(false)
+    })();
+    match operation {
+        Ok(true) => {
+            write_json_new(&run_dir.join("recovery-complete.json"), &receipt)?;
+            Ok(Some((receipt, run_dir)))
+        }
+        Ok(false) => {
+            write_json_new(&run_dir.join(RECOVERY_SUPERSEDED_RECEIPT), &receipt)?;
+            Ok(None)
+        }
+        Err(error) => {
+            receipt.error = Some(error.to_string());
+            write_json_new(&run_dir.join("recovery-failed.json"), &receipt)?;
+            Err(BeadsError::WithContext {
+                context: format!(
+                    "WAL index recovery failed at {}; the original index is retained at {}",
+                    receipt.stage,
+                    before_dir.display()
+                ),
+                source: Box::new(error),
+            })
+        }
+    }
+}
+
+/// Check a retained copy against the witness it was taken under.
+fn verify_retained_component(copy: &Path, witness: &RawComponentWitness) -> Result<()> {
+    let metadata = secure_file_metadata(copy)?.ok_or_else(|| {
+        BeadsError::internal(format!("retained copy is missing: {}", copy.display()))
+    })?;
+    let (length, sha256) = hash_regular_file(copy, &metadata)?;
+    if witness.length != Some(length) || witness.sha256.as_deref() != Some(sha256.as_str()) {
+        return Err(BeadsError::internal(format!(
+            "retained copy does not match the pre-recovery witness: {}",
+            copy.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Put the retained pre-recovery index back as the live `-shm`, atomically
+/// and with its original permissions. Runs only under the held family write
+/// authority and sole-opener lease of the recovery that removed it.
+fn reinstate_retained_index(
+    db_path: &Path,
+    retained: &Path,
+    witness: &RawComponentWitness,
+) -> Result<()> {
+    let live = family_component_path(db_path, "-shm");
+    let parent = live
+        .parent()
+        .ok_or_else(|| BeadsError::internal("WAL index path has no parent directory"))?;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    let staged = parent.join(format!(
+        ".{}.reinstate-{}-{nonce}.tmp",
+        live.file_name()
+            .map_or_else(|| "shm".into(), |name| name.to_string_lossy()),
+        std::process::id()
+    ));
+    copy_regular_file_new(retained, &staged, witness.unix_mode)?;
+    let installed = verify_retained_component(&staged, witness)
+        .and_then(|()| fs::rename(&staged, &live).map_err(BeadsError::Io));
+    if installed.is_err() {
+        // Our own staging copy; the retained original is untouched.
+        let _ = fs::remove_file(&staged);
+    }
+    installed?;
+    sync_directory(parent)
+}
+
+/// Remove this database's completed WAL-index recovery runs that are both
+/// outside the newest [`RECOVERY_RUNS_KEPT`] and older than
+/// [`RECOVERY_RUN_MIN_AGE_DAYS`].
+///
+/// Deliberately narrow. Only directories br created under
+/// `.br_recovery/schema-migrations/` with a recovery receipt for this
+/// database count as recovery runs. A run is removed only when it finished
+/// (`recovery-complete.json`, or an index-only run superseded by a complete
+/// backup) and carries no failure receipt; failed and in-progress runs are
+/// the evidence a later diagnosis needs and are never removed, and neither is
+/// `current_run`. Schema-migration runs (`undo` reads their backups) have no
+/// recovery receipt and are never touched. A run whose name does not carry
+/// the timestamp br writes is kept.
+fn prune_recovery_runs(
+    beads_dir: &Path,
+    db_path: &Path,
+    current_run: &Path,
+    now: chrono::DateTime<Utc>,
+) -> Result<Vec<PathBuf>> {
+    let root = migration_runs_root(beads_dir);
+    let entries = match fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(BeadsError::Io(error)),
+    };
+    let database_path = db_path.display().to_string();
+    let mut runs = Vec::new();
+    let mut interrupted_prunes = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(BeadsError::Io)?;
+        let file_type = entry.file_type().map_err(BeadsError::Io)?;
+        if !file_type.is_dir() || file_type.is_symlink() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let path = entry.path();
+        if name.starts_with(PRUNING_PREFIX) {
+            interrupted_prunes.push(path);
+            continue;
+        }
+        let Some(created) = recovery_run_timestamp(&name) else {
+            continue;
+        };
+        let Some(status) = recovery_run_status(&path, &database_path)? else {
+            continue;
+        };
+        runs.push((created, path, status));
+    }
+    // Newest first; ties broken by name so the order is total.
+    runs.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1)));
+    let min_age = chrono::Duration::days(RECOVERY_RUN_MIN_AGE_DAYS);
+    let mut pruned = Vec::new();
+    for (created, path, status) in runs.into_iter().skip(RECOVERY_RUNS_KEPT) {
+        if status != RecoveryRunStatus::Finished || path == current_run || now - created < min_age {
+            continue;
+        }
+        let Some(name) = path.file_name() else {
+            continue;
+        };
+        let mut doomed_name = OsString::from(PRUNING_PREFIX);
+        doomed_name.push(name);
+        let doomed = root.join(doomed_name);
+        if let Err(error) = fs::rename(&path, &doomed) {
+            tracing::warn!(run = %path.display(), %error, "could not set aside old recovery run");
+            continue;
+        }
+        interrupted_prunes.push(doomed);
+        pruned.push(path);
+    }
+    if !interrupted_prunes.is_empty() {
+        sync_directory(&root)?;
+    }
+    for doomed in interrupted_prunes {
+        if let Err(error) = fs::remove_dir_all(&doomed) {
+            tracing::warn!(run = %doomed.display(), %error, "could not remove old recovery run");
+        }
+    }
+    Ok(pruned)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveryRunStatus {
+    Finished,
+    /// Failed, or prepared without a verdict (interrupted, or running).
+    Retained,
+}
+
+/// The creation time `allocate_run_id` encodes at the front of a run name
+/// (`20260930T120000.123456Z-<pid>-<n>`).
+fn recovery_run_timestamp(name: &str) -> Option<chrono::DateTime<Utc>> {
+    let (stamp, _) = name.split_once("Z-")?;
+    chrono::NaiveDateTime::parse_from_str(stamp, "%Y%m%dT%H%M%S%.f")
+        .ok()
+        .map(|naive| naive.and_utc())
+}
+
+/// Classify a run directory as a recovery run of `database_path`, or `None`
+/// for anything else (schema-migration runs, other databases' runs, runs
+/// whose receipt this binary cannot read).
+fn recovery_run_status(run_dir: &Path, database_path: &str) -> Result<Option<RecoveryRunStatus>> {
+    let prepared = run_dir.join("recovery-prepared.json");
+    let bytes = match fs::read(&prepared) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(BeadsError::Io(error)),
+    };
+    let Ok(receipt) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return Ok(None);
+    };
+    if receipt
+        .get("database_path")
+        .and_then(serde_json::Value::as_str)
+        != Some(database_path)
+    {
+        return Ok(None);
+    }
+    let has =
+        |name: &str| -> Result<bool> { Ok(secure_file_metadata(&run_dir.join(name))?.is_some()) };
+    if has("recovery-failed.json")? {
+        return Ok(Some(RecoveryRunStatus::Retained));
+    }
+    if has("recovery-complete.json")? || has(RECOVERY_SUPERSEDED_RECEIPT)? {
+        return Ok(Some(RecoveryRunStatus::Finished));
+    }
+    Ok(Some(RecoveryRunStatus::Retained))
+}
+
+fn recover_engine_admission_with_complete_backup(
+    migration: &MigrationContext,
+    strict_wal: bool,
+    policy: PreexistingIndexCorruption,
+) -> Result<(EngineRecoveryReceipt, PathBuf)> {
     migration.write_authority.verify_database_authority()?;
     refuse_non_regular_component(&migration.db_path)?;
     let raw_before = recovery_family_witness(&migration.db_path)?;
@@ -489,10 +1204,12 @@ fn recover_engine_admission(
         schema_version: "br.doctor.schema_migration.recovery.v1",
         database_path: migration.db_path.display().to_string(),
         backup_path: before_dir.display().to_string(),
+        backup_scope: RECOVERY_BACKUP_COMPLETE_FAMILY,
         stage: "private-recovery".to_string(),
         raw_before,
         raw_after: None,
         logical_after: None,
+        index_corruption: None,
         error: None,
     };
     write_json_new(&run_dir.join("recovery-prepared.json"), &receipt)?;
@@ -511,9 +1228,12 @@ fn recover_engine_admission(
         require_recovery_payload_unchanged(&probe_before, &recovery_family_witness(&probe_db)?)?;
         let expected = logical_witness(&probe_db)?;
         if !integrity_check_is_clean(&expected.integrity_check) {
-            return Err(BeadsError::internal(
-                "private engine recovery did not produce clean integrity",
-            ));
+            receipt.index_corruption = Some(admit_preexisting_index_damage(
+                &probe_db,
+                &run_dir.join("index-rehearsal"),
+                &expected,
+                policy,
+            )?);
         }
         receipt.stage = "live-preflight".to_string();
         migration.write_authority.verify_database_authority()?;
@@ -551,7 +1271,7 @@ fn recover_engine_admission(
         });
     }
     write_json_new(&run_dir.join("recovery-complete.json"), &receipt)?;
-    Ok(receipt)
+    Ok((receipt, run_dir))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -627,7 +1347,9 @@ fn build_plan(db_path: &Path) -> Result<MigrationPlanReceipt> {
     if !REVIEWED_MIGRATION_SOURCE_VERSIONS.contains(&from) {
         return Err(BeadsError::internal(format!(
             "reviewed schema migration is available only from source schemas 13, 14, 15, 16, 17, and 18 \
-             to {target}; observed unsupported source version {from}"
+             to {target}; observed unsupported source version {from}. Run \
+             `br doctor migrate-schema heal` instead: it rebuilds this database from issues.jsonl, \
+             keeps database-only issues, and retains the old database as a backup"
         )));
     }
     if !integrity_clean && !integrity_check_is_repairable(&logical_witness.integrity_check) {
@@ -723,9 +1445,33 @@ fn emit_plan(plan: &MigrationPlanReceipt, json: bool) -> Result<()> {
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)]
 fn execute_apply(args: &DoctorMigrateSchemaApplyArgs, migration: &MigrationContext) -> Result<()> {
-    if args.plan_token.trim().is_empty() {
+    let (applied, before_dir) = apply_with_plan_token(args.plan_token.trim(), migration)?;
+    emit_applied(&applied, args.json, &before_dir)
+}
+
+/// Plan and immediately apply the reviewed migration for the database the
+/// caller already holds authority over, returning the verified pre-migration
+/// recovery bundle directory. Used by the stale-schema heal, which has
+/// already audited the upgrade; the plan is still recomputed and token-bound
+/// exactly as an operator-driven `plan` + `apply` pair would be.
+pub(super) fn plan_and_apply(migration: &MigrationContext) -> Result<PathBuf> {
+    let plan = build_plan(&migration.db_path)?;
+    let token = plan.plan_token.ok_or_else(|| {
+        BeadsError::internal(format!(
+            "schema migration is not eligible for this database: {}",
+            plan.note
+        ))
+    })?;
+    apply_with_plan_token(&token, migration).map(|(_, before_dir)| before_dir)
+}
+
+#[allow(clippy::too_many_lines)]
+fn apply_with_plan_token(
+    plan_token: &str,
+    migration: &MigrationContext,
+) -> Result<(AppliedMigrationReceipt, PathBuf)> {
+    if plan_token.is_empty() {
         return Err(BeadsError::internal(
             "schema migration apply requires a non-empty --plan-token",
         ));
@@ -734,8 +1480,8 @@ fn execute_apply(args: &DoctorMigrateSchemaApplyArgs, migration: &MigrationConte
     // filesystem before either a fresh migration or a recovery path can write.
     #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
     verify_migration_exchange_support(&migration.db_path, exchange_database_paths)?;
-    if let Some((applied, before_dir)) = resume_commit_ready_migration(args, migration)? {
-        return emit_applied(&applied, args.json, &before_dir);
+    if let Some(resumed) = resume_commit_ready_migration(plan_token, migration)? {
+        return Ok(resumed);
     }
     let plan = build_plan(&migration.db_path)?;
     let Some(recomputed_token) = plan.plan_token.as_deref() else {
@@ -743,12 +1489,11 @@ fn execute_apply(args: &DoctorMigrateSchemaApplyArgs, migration: &MigrationConte
             "schema migration apply refused because no migration is currently eligible",
         ));
     };
-    if !constant_time_text_eq(recomputed_token, args.plan_token.trim()) {
+    if !constant_time_text_eq(recomputed_token, plan_token) {
         return Err(BeadsError::internal(format!(
             "schema migration plan token is stale or belongs to a different database state \
-             (provided {}, recomputed {}); run `br doctor migrate-schema plan` again",
-            args.plan_token.trim(),
-            recomputed_token
+             (provided {plan_token}, recomputed {recomputed_token}); run \
+             `br doctor migrate-schema plan` again"
         )));
     }
     let forecast = plan
@@ -785,6 +1530,7 @@ fn execute_apply(args: &DoctorMigrateSchemaApplyArgs, migration: &MigrationConte
         &forecast,
         &marked_at,
         &run_dir,
+        &plan.raw_witness,
         &migration.write_authority,
         &mut failed_stage,
     );
@@ -932,7 +1678,7 @@ fn execute_apply(args: &DoctorMigrateSchemaApplyArgs, migration: &MigrationConte
         )));
     }
 
-    emit_applied(&applied, args.json, &before_dir)
+    Ok((applied, before_dir))
 }
 
 fn emit_applied(applied: &AppliedMigrationReceipt, json: bool, before_dir: &Path) -> Result<()> {
@@ -1062,7 +1808,7 @@ fn validate_commit_ready_marker(
 
 #[allow(clippy::too_many_lines)]
 fn resume_commit_ready_migration(
-    args: &DoctorMigrateSchemaApplyArgs,
+    plan_token: &str,
     migration: &MigrationContext,
 ) -> Result<Option<(AppliedMigrationReceipt, PathBuf)>> {
     let root = migration_runs_root(&migration.beads_dir);
@@ -1087,7 +1833,7 @@ fn resume_commit_ready_migration(
         let marker: CommitReadyMigrationReceipt = read_json(&marker_path)?;
         validate_commit_ready_marker(&marker, &run_dir)?;
         if marker.database_path != database_path
-            || !constant_time_text_eq(&marker.plan_token, args.plan_token.trim())
+            || !constant_time_text_eq(&marker.plan_token, plan_token)
         {
             continue;
         }
@@ -1467,6 +2213,7 @@ fn apply_reviewed_migration(
     forecast: &MigrationForecast,
     marked_at: &str,
     run_dir: &Path,
+    raw_before: &RawFamilyWitness,
     write_authority: &Arc<DatabaseFamilyWriteLock>,
     failed_stage: &mut Option<String>,
 ) -> Result<ReviewedSchemaMigrationEffectsReceipt> {
@@ -1475,6 +2222,7 @@ fn apply_reviewed_migration(
         forecast,
         marked_at,
         run_dir,
+        raw_before,
         write_authority,
         failed_stage,
     )
@@ -1537,12 +2285,52 @@ fn canonical_index_name(statement: &str) -> Result<&str> {
     Ok(name)
 }
 
+/// Build the VACUUM candidate from a disposable copy of the verified recovery
+/// snapshot, never from the live database family.
+///
+/// FrankenSQLite's VACUUM path can rewrite WAL/index state on the source
+/// connection. Running it against the authority-held live family made an
+/// interrupted migration capable of poisoning the very source it was supposed
+/// to preserve (#507). The immutable `before/` bundle remains the rollback
+/// authority; a second private copy absorbs every source-side VACUUM mutation.
+fn vacuum_candidate_from_private_source(
+    db_path: &Path,
+    candidate_path: &Path,
+    run_dir: &Path,
+    raw_before: &RawFamilyWitness,
+) -> Result<()> {
+    let before_dir = run_dir.join("before");
+    verify_backup_family(db_path, &before_dir, raw_before)?;
+
+    let retained_source = backup_component_path(&before_dir, db_path, "")?;
+    let private_source_dir = run_dir.join("maintenance-vacuum-source");
+    ensure_new_directory(&private_source_dir)?;
+    copy_family_to_backup(&retained_source, &private_source_dir, raw_before)?;
+    verify_backup_family(&retained_source, &private_source_dir, raw_before)?;
+    sync_directory(&private_source_dir)?;
+    sync_directory(run_dir)?;
+
+    let private_source = backup_component_path(&private_source_dir, &retained_source, "")?;
+    let source_conn = Connection::open(private_source.to_string_lossy().into_owned())?;
+    let escaped_path = candidate_path.to_string_lossy().replace('\'', "''");
+    let candidate_result = source_conn
+        .execute(&format!("VACUUM INTO '{escaped_path}'"))
+        .map(|_| ())
+        .map_err(BeadsError::Database);
+    let close_result = close_connection(source_conn);
+    match (candidate_result, close_result) {
+        (Err(error), _) | (Ok(()), Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn run_post_migration_maintenance(
     db_path: &Path,
     forecast: &MigrationForecast,
     marked_at: &str,
     run_dir: &Path,
+    raw_before: &RawFamilyWitness,
     write_authority: &Arc<DatabaseFamilyWriteLock>,
     failed_stage: &mut Option<String>,
 ) -> Result<ReviewedSchemaMigrationEffectsReceipt> {
@@ -1560,17 +2348,7 @@ fn run_post_migration_maintenance(
     mark_stage(failed_stage, "vacuum-candidate");
     let candidate_path = maintenance_candidate_path(db_path, run_dir)?;
     require_absent_family(&candidate_path)?;
-    let source_conn = Connection::open(db_path.to_string_lossy().into_owned())?;
-    let escaped_path = candidate_path.to_string_lossy().replace('\'', "''");
-    let candidate_result = source_conn
-        .execute(&format!("VACUUM INTO '{escaped_path}'"))
-        .map(|_| ())
-        .map_err(BeadsError::Database);
-    let close_result = close_connection(source_conn);
-    match (candidate_result, close_result) {
-        (Err(error), _) | (Ok(()), Err(error)) => return Err(error),
-        (Ok(()), Ok(())) => {}
-    }
+    vacuum_candidate_from_private_source(db_path, &candidate_path, run_dir, raw_before)?;
 
     let effects = if from == to {
         ReviewedSchemaMigrationEffectsReceipt {
@@ -3661,6 +4439,128 @@ fn integrity_check_is_clean(integrity_check: &str) -> bool {
     integrity_check.trim().eq_ignore_ascii_case("ok")
 }
 
+/// Decide whether recovery may continue past a recovered private copy
+/// (`probe_db`, witnessed as `expected`) whose integrity check failed.
+///
+/// Recovery rebuilds only the derived index, and the probe's main/WAL/journal
+/// bytes were just proven unchanged, so the damage was already in the durable
+/// family. When rebuilding the user indexes on a further private copy clears
+/// it without changing the schema or any row, it is the damage
+/// `br doctor --repair-indexes` fixes, and refusing engine admission would only
+/// lock the operator out of that command (GH #523). Anything else refuses.
+fn admit_preexisting_index_damage(
+    probe_db: &Path,
+    rehearsal_dir: &Path,
+    expected: &LogicalDatabaseWitness,
+    policy: PreexistingIndexCorruption,
+) -> Result<IndexCorruptionFinding> {
+    let summary = integrity_summary(&expected.integrity_check);
+    if !index_rebuild_restores_integrity(probe_db, rehearsal_dir, expected)? {
+        return Err(BeadsError::internal(format!(
+            "private engine recovery did not produce clean integrity ({summary}), and \
+             rebuilding every index on a private copy did not repair it, so the damage is not \
+             confined to indexes. The live database was not touched; run `br doctor` for \
+             diagnosis"
+        )));
+    }
+    let finding = IndexCorruptionFinding {
+        integrity_check: expected.integrity_check.clone(),
+        remediation: IndexCorruptionFinding::REMEDIATION,
+        index_entries_without_table_rows: integrity_reports_index_entries_without_table_rows(
+            &expected.integrity_check,
+        ),
+    };
+    match policy {
+        PreexistingIndexCorruption::Refuse => {
+            let warning = if finding.index_entries_without_table_rows {
+                format!(" {}", IndexCorruptionFinding::MISSING_ROWS_WARNING)
+            } else {
+                String::new()
+            };
+            Err(BeadsError::internal(format!(
+                "private engine recovery did not produce clean integrity because the database \
+                 already has corrupt indexes ({summary}). A private rehearsal showed that \
+                 rebuilding them repairs it without changing any row. The live database was not \
+                 touched. Run `br doctor migrate-schema recover` to restore the WAL index, then \
+                 `{}` to rebuild the indexes.{warning}",
+                IndexCorruptionFinding::REMEDIATION
+            )))
+        }
+        PreexistingIndexCorruption::Admit => Ok(finding),
+    }
+}
+
+/// The first few diagnostics of an integrity report on one line.
+fn integrity_summary(integrity_check: &str) -> String {
+    const SHOWN: usize = 3;
+    let messages = integrity_check
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with("*** in database"))
+        .collect::<Vec<_>>();
+    let mut summary = messages
+        .iter()
+        .take(SHOWN)
+        .copied()
+        .collect::<Vec<_>>()
+        .join("; ");
+    if messages.len() > SHOWN {
+        summary = format!("{summary}; and {} more", messages.len() - SHOWN);
+    }
+    summary
+}
+
+/// Rehearse `br doctor --repair-indexes` on a private copy of `db_path`'s
+/// family made in the new directory `rehearsal_dir`: rebuild every user
+/// index, then require clean integrity with the schema and every row
+/// unchanged from `before`. `false` means the damage is not confined to
+/// what that command repairs (GH #523). Only the private copy is written.
+fn index_rebuild_restores_integrity(
+    db_path: &Path,
+    rehearsal_dir: &Path,
+    before: &LogicalDatabaseWitness,
+) -> Result<bool> {
+    ensure_new_directory(rehearsal_dir)?;
+    let family = recovery_family_witness(db_path)?;
+    copy_family_to_backup(db_path, rehearsal_dir, &family)?;
+    verify_backup_family(db_path, rehearsal_dir, &family)?;
+    let copy = backup_component_path(rehearsal_dir, db_path, "")?;
+    let conn = Connection::open(copy.to_string_lossy().into_owned())?;
+    let rebuilt = (|| -> Result<()> {
+        let names = conn
+            .query(
+                "SELECT name FROM sqlite_master WHERE type = 'index' \
+                 AND name NOT LIKE 'sqlite_autoindex_%' AND sql IS NOT NULL ORDER BY name",
+            )?
+            .iter()
+            .filter_map(|row| row.get(0).and_then(SqliteValue::as_text).map(String::from))
+            .collect::<Vec<_>>();
+        conn.execute("BEGIN IMMEDIATE")?;
+        for name in &names {
+            if let Err(error) = conn.execute(&format!("REINDEX {}", quote_identifier(name))) {
+                let _ = conn.execute("ROLLBACK");
+                return Err(error.into());
+            }
+        }
+        conn.execute("COMMIT")?;
+        Ok(())
+    })();
+    let closed = close_connection(conn);
+    let after = rebuilt.and(closed).and_then(|()| logical_witness(&copy));
+    match after {
+        Ok(after) => Ok(integrity_check_is_clean(&after.integrity_check)
+            && logical_witnesses_match_except_integrity(before, &after)),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                copy = %copy.display(),
+                "rebuilding indexes on a private recovery copy failed"
+            );
+            Ok(false)
+        }
+    }
+}
+
 fn integrity_check_is_repairable(integrity_check: &str) -> bool {
     let mut saw_repairable = false;
     for message in integrity_check
@@ -4499,6 +5399,269 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// GH #520: on Windows the engine keeps its WAL index in private memory,
+    /// so a stock-SQLite index beside a header-only WAL (or no index at all)
+    /// must never start automatic recovery, whose quarantine step cannot run
+    /// there and would otherwise fail every command before it did any work.
+    #[test]
+    fn private_index_engine_never_needs_wal_index_recovery_gh520() {
+        let temp = TempDir::new().unwrap();
+        let db = temp.path().join("beads.db");
+        crate::franken_sync::wal_index::tests::write_stock_header_only_family(&db);
+        // Only reads go through stock SQLite's empty index on FrankenSQLite
+        // 0.4.7 (GH#431); the first commit still needs it rebuilt.
+        assert!(wal_index_needs_recovery_for_engine(&db, true).unwrap());
+        assert!(!wal_index_needs_recovery_for_engine(&db, false).unwrap());
+        assert_eq!(
+            wal_index_needs_recovery(&db).unwrap(),
+            crate::franken_sync::wal_index::STARTUP_WAL_INDEX_RECOVERY
+        );
+
+        // Same split for a complete WAL whose index file is absent.
+        let shm = family_component_path(&db, "-shm");
+        fs::rename(&shm, temp.path().join("retained-shm")).unwrap();
+        assert!(missing_wal_index_for_engine(&db, true).unwrap());
+        assert!(!missing_wal_index_for_engine(&db, false).unwrap());
+        assert!(wal_index_needs_recovery_for_engine(&db, true).unwrap());
+        assert!(!wal_index_needs_recovery_for_engine(&db, false).unwrap());
+        assert_eq!(
+            missing_wal_index(&db).unwrap(),
+            crate::franken_sync::wal_index::STARTUP_WAL_INDEX_RECOVERY
+        );
+    }
+
+    /// One run directory as br lays it out. `receipts` names the receipt
+    /// files to write; recovery receipts carry `database_path`.
+    fn make_run(root: &Path, name: &str, database_path: &str, receipts: &[&str]) -> PathBuf {
+        let run = root.join(name);
+        fs::create_dir_all(run.join("recovery-before")).unwrap();
+        fs::write(run.join("recovery-before").join("beads.db"), b"retained").unwrap();
+        for receipt in receipts {
+            fs::write(
+                run.join(receipt),
+                serde_json::json!({ "database_path": database_path }).to_string(),
+            )
+            .unwrap();
+        }
+        run
+    }
+
+    fn run_name(now: chrono::DateTime<Utc>, days_ago: i64, counter: u32) -> String {
+        format!(
+            "{}-4242-{counter}",
+            (now - chrono::Duration::days(days_ago)).format("%Y%m%dT%H%M%S%.6fZ")
+        )
+    }
+
+    #[test]
+    fn recovery_run_names_carry_their_creation_time() {
+        let run_id = allocate_run_id(TempDir::new().unwrap().path()).unwrap();
+        let created = recovery_run_timestamp(&run_id).expect("allocate_run_id format parses");
+        assert!((Utc::now() - created).num_seconds().abs() < 60, "{run_id}");
+        assert!(recovery_run_timestamp("not-a-run").is_none());
+        assert!(recovery_run_timestamp("20269999T000000.000000Z-1-0").is_none());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn recovery_retention_prunes_only_old_finished_runs_of_this_database() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let database = db_path.display().to_string();
+        let root = migration_runs_root(&beads_dir);
+        fs::create_dir_all(&root).unwrap();
+        let now = Utc::now();
+        let prepared = "recovery-prepared.json";
+        let complete = "recovery-complete.json";
+
+        let current = make_run(
+            &root,
+            &run_name(now, 0, 0),
+            &database,
+            &[prepared, complete],
+        );
+        // Newest first after the current run: three recent finished runs, then
+        // an index-only run superseded by a complete backup.
+        let recent: Vec<PathBuf> = (1..=3)
+            .map(|day| {
+                make_run(
+                    &root,
+                    &run_name(now, day, 0),
+                    &database,
+                    &[prepared, complete],
+                )
+            })
+            .collect();
+        let superseded_recent = make_run(
+            &root,
+            &run_name(now, 4, 0),
+            &database,
+            &[prepared, RECOVERY_SUPERSEDED_RECEIPT],
+        );
+        // Beyond the newest five but younger than seven days: kept.
+        let young = make_run(
+            &root,
+            &run_name(now, 5, 0),
+            &database,
+            &[prepared, complete],
+        );
+        // Beyond the newest five and older than seven days: pruned.
+        let old_finished: Vec<PathBuf> = (10..=12)
+            .map(|day| {
+                make_run(
+                    &root,
+                    &run_name(now, day, 0),
+                    &database,
+                    &[prepared, complete],
+                )
+            })
+            .collect();
+        let old_superseded = make_run(
+            &root,
+            &run_name(now, 13, 0),
+            &database,
+            &[prepared, RECOVERY_SUPERSEDED_RECEIPT],
+        );
+        // Evidence and foreign runs that no age may remove.
+        let old_failed = make_run(
+            &root,
+            &run_name(now, 20, 0),
+            &database,
+            &[prepared, "recovery-failed.json"],
+        );
+        let old_in_progress = make_run(&root, &run_name(now, 21, 0), &database, &[prepared]);
+        let old_other_database = make_run(
+            &root,
+            &run_name(now, 22, 0),
+            "/elsewhere/.beads/beads.db",
+            &[prepared, complete],
+        );
+        let old_migration = make_run(
+            &root,
+            &run_name(now, 23, 0),
+            &database,
+            &["prepared.json", "applied.json"],
+        );
+        let unreadable_receipt = root.join(run_name(now, 24, 0));
+        fs::create_dir_all(&unreadable_receipt).unwrap();
+        fs::write(unreadable_receipt.join(prepared), b"{ not json").unwrap();
+        fs::write(unreadable_receipt.join(complete), b"{}").unwrap();
+        let unnamed = make_run(&root, "operator-kept-run", &database, &[prepared, complete]);
+        let interrupted = root.join(format!("{PRUNING_PREFIX}{}", run_name(now, 30, 0)));
+        fs::create_dir_all(interrupted.join("recovery-before")).unwrap();
+
+        let mut pruned = prune_recovery_runs(&beads_dir, &db_path, &current, now).unwrap();
+        pruned.sort();
+        let mut expected: Vec<PathBuf> = old_finished.clone();
+        expected.push(old_superseded.clone());
+        expected.sort();
+        assert_eq!(pruned, expected);
+        for gone in old_finished.iter().chain([&old_superseded, &interrupted]) {
+            assert!(!gone.exists(), "{} must be removed", gone.display());
+        }
+        for kept in recent.iter().chain([
+            &current,
+            &superseded_recent,
+            &young,
+            &old_failed,
+            &old_in_progress,
+            &old_other_database,
+            &old_migration,
+            &unreadable_receipt,
+            &unnamed,
+        ]) {
+            assert!(kept.is_dir(), "{} must be kept", kept.display());
+        }
+        let leftovers: Vec<String> = fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(PRUNING_PREFIX))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+
+        // Idempotent: nothing further qualifies.
+        assert!(
+            prune_recovery_runs(&beads_dir, &db_path, &current, now)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn recovery_retention_never_prunes_the_current_run_or_within_the_newest_five() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let database = db_path.display().to_string();
+        let root = migration_runs_root(&beads_dir);
+        fs::create_dir_all(&root).unwrap();
+        let now = Utc::now();
+        // Every run is old; only the count protects the newest five, and the
+        // "current" run is protected even though it sorts last here.
+        let runs: Vec<PathBuf> = (0..7)
+            .map(|index| {
+                make_run(
+                    &root,
+                    &run_name(now, 30 + index, 0),
+                    &database,
+                    &["recovery-prepared.json", "recovery-complete.json"],
+                )
+            })
+            .collect();
+        let current = runs.last().unwrap().clone();
+        let pruned = prune_recovery_runs(&beads_dir, &db_path, &current, now).unwrap();
+        assert_eq!(pruned, vec![runs[5].clone()]);
+        for (index, run) in runs.iter().enumerate() {
+            assert_eq!(run.is_dir(), index != 5, "run {index}");
+        }
+
+        // No runs root at all is not an error.
+        let empty = TempDir::new().unwrap();
+        assert!(
+            prune_recovery_runs(empty.path(), &db_path, &current, now)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_retention_ignores_symlinked_runs() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let database = db_path.display().to_string();
+        let root = migration_runs_root(&beads_dir);
+        fs::create_dir_all(&root).unwrap();
+        let now = Utc::now();
+        let outside = make_run(
+            temp.path(),
+            "outside-target",
+            &database,
+            &["recovery-prepared.json", "recovery-complete.json"],
+        );
+        for index in 0..6 {
+            make_run(
+                &root,
+                &run_name(now, index, 0),
+                &database,
+                &["recovery-prepared.json", "recovery-complete.json"],
+            );
+        }
+        let link = root.join(run_name(now, 40, 0));
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        let current = root.join(run_name(now, 0, 0));
+        prune_recovery_runs(&beads_dir, &db_path, &current, now).unwrap();
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(outside.join("recovery-before").join("beads.db").is_file());
+    }
+
     #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
     #[test]
     fn exchange_preflight_accepts_real_exchange_without_touching_database() {
@@ -4744,6 +5907,41 @@ mod tests {
     }
 
     #[test]
+    fn index_entries_without_table_rows_are_recognized() {
+        // GH #523 review: these diagnostics can mean a row was lost from its
+        // table, which an index rebuild would silently accept.
+        for lost in [
+            "database disk image is malformed: index `idx_comments_issue` contains stale rowid \
+             5 with no matching table row",
+            "database disk image is malformed: index `idx_events_issue` contains 7 entries but \
+             table `events` requires exactly 6",
+            "*** in database main ***\nindex `i` contains 12 entries but table `t` requires \
+             exactly 3",
+        ] {
+            assert!(
+                integrity_reports_index_entries_without_table_rows(lost),
+                "{lost}"
+            );
+        }
+        // An index missing entries, or structural index damage, is safe to rebuild.
+        for index_only in [
+            "database disk image is malformed: table `issues` rowid 30 is missing from index \
+             `idx_issues_updated_at`",
+            "database disk image is malformed: index `i` contains 5 entries but table `t` \
+             requires exactly 6",
+            "database disk image is malformed: index idx_issues_updated_at root: page 210 \
+             freeblocks invalid",
+            "wrong # of entries in index idx_issues_updated_at",
+            "ok",
+        ] {
+            assert!(
+                !integrity_reports_index_entries_without_table_rows(index_only),
+                "{index_only}"
+            );
+        }
+    }
+
+    #[test]
     fn integrity_classification_allows_only_known_page_layout_artifacts() {
         assert!(integrity_check_is_clean("ok"));
         assert!(!integrity_check_is_repairable("ok"));
@@ -4832,6 +6030,62 @@ mod tests {
 
     fn reviewed_v14_migration_context() -> (TempDir, MigrationContext) {
         reviewed_v14_migration_context_with_database_name("beads.db")
+    }
+
+    #[test]
+    fn vacuum_candidate_never_opens_or_rewrites_live_wal_family() {
+        let (_temp, migration) = reviewed_source_migration_context("beads.db", 17);
+        let mut writer =
+            Connection::open(migration.db_path.to_string_lossy().into_owned()).unwrap();
+        writer.execute("PRAGMA journal_mode = WAL").unwrap();
+        writer.execute("PRAGMA wal_autocheckpoint = 0").unwrap();
+        writer
+            .execute("UPDATE issues SET title = 'private vacuum source sentinel'")
+            .unwrap();
+        writer.close_without_checkpoint_in_place().unwrap();
+        drop(writer);
+
+        let logical_before = logical_witness(&migration.db_path).unwrap();
+        let raw_before = raw_family_witness(&migration.db_path).unwrap();
+        let wal_path = family_component_path(&migration.db_path, "-wal");
+        assert!(
+            fs::metadata(&wal_path).unwrap().len() > 32,
+            "fixture must retain committed WAL frames"
+        );
+
+        let run_dir = migration.beads_dir.join("private-vacuum-source-test");
+        let before_dir = run_dir.join("before");
+        ensure_new_directory(&run_dir).unwrap();
+        ensure_new_directory(&before_dir).unwrap();
+        copy_family_to_backup(&migration.db_path, &before_dir, &raw_before).unwrap();
+        verify_backup_family(&migration.db_path, &before_dir, &raw_before).unwrap();
+
+        let candidate = maintenance_candidate_path(&migration.db_path, &run_dir).unwrap();
+        require_absent_family(&candidate).unwrap();
+        vacuum_candidate_from_private_source(&migration.db_path, &candidate, &run_dir, &raw_before)
+            .unwrap();
+
+        assert_eq!(
+            raw_family_witness(&migration.db_path).unwrap(),
+            raw_before,
+            "VACUUM candidate construction must not touch any live family byte"
+        );
+        assert_eq!(logical_witness(&migration.db_path).unwrap(), logical_before);
+
+        let candidate_logical = logical_witness(&candidate).unwrap();
+        assert_eq!(candidate_logical.user_version, logical_before.user_version);
+        assert_eq!(
+            candidate_logical.contents_sha256,
+            logical_before.contents_sha256
+        );
+        assert_eq!(candidate_logical.tables, logical_before.tables);
+        assert!(
+            run_dir
+                .join("maintenance-vacuum-source")
+                .join("beads.db")
+                .is_file(),
+            "the disposable source is retained for interrupted-migration diagnosis"
+        );
     }
 
     #[test]
@@ -5170,7 +6424,22 @@ mod tests {
             let conn = Connection::open(migration.db_path.to_string_lossy().into_owned()).unwrap();
             conn.execute(&declaration(before)).unwrap();
             close_connection(conn).unwrap();
-            let plan_before = build_plan(&migration.db_path).unwrap();
+            let plan_before = match build_plan(&migration.db_path) {
+                Ok(plan) => plan,
+                // FrankenSQLite 0.4.6+ evaluates CHECK expressions in
+                // `integrity_check` without SQLite's double-quoted-string
+                // fallback, so an unresolvable "ALLOWED" is reported as a
+                // missing column where stock SQLite says ok. Planning then
+                // refuses, which already keeps a stale plan from authorizing
+                // anything.
+                Err(error)
+                    if before.contains("\"ALLOWED\"")
+                        && error.to_string().contains("no such column: ALLOWED") =>
+                {
+                    continue;
+                }
+                Err(error) => panic!("plan for {before}: {error}"),
+            };
             let conn = Connection::open(migration.db_path.to_string_lossy().into_owned()).unwrap();
             conn.execute("DROP TABLE operator_constraint").unwrap();
             conn.execute(&declaration(changed)).unwrap();
@@ -6239,15 +7508,9 @@ mod tests {
             beads_dir,
             db_path,
         };
-        let (applied, resumed_before_dir) = resume_commit_ready_migration(
-            &DoctorMigrateSchemaApplyArgs {
-                plan_token,
-                json: false,
-            },
-            &migration,
-        )
-        .expect("resume commit-ready migration")
-        .expect("committed generation must materialize applied receipt");
+        let (applied, resumed_before_dir) = resume_commit_ready_migration(&plan_token, &migration)
+            .expect("resume commit-ready migration")
+            .expect("committed generation must materialize applied receipt");
         assert_eq!(resumed_before_dir, before_dir);
         assert!(applied.attested);
         assert!(run_dir.join("applied.json").is_file());
@@ -6315,14 +7578,8 @@ mod tests {
         )
         .expect("persist pre-install commit-ready marker");
 
-        let resumed = resume_commit_ready_migration(
-            &DoctorMigrateSchemaApplyArgs {
-                plan_token,
-                json: false,
-            },
-            &migration,
-        )
-        .expect("classify interrupted pre-install intent");
+        let resumed = resume_commit_ready_migration(&plan_token, &migration)
+            .expect("classify interrupted pre-install intent");
         assert!(
             resumed.is_none(),
             "an unchanged original generation must be retried, never called applied"
@@ -6784,6 +8041,17 @@ mod tests {
             logical_before: plan.logical_witness,
         };
         write_json_new(&run_dir.join("prepared.json"), &prepared).expect("write prepared receipt");
+        // The retained `before/` family is part of the prepared state the real
+        // pipeline lays down before it applies anything (see the prepare path),
+        // and `vacuum-candidate` verifies it to build its private VACUUM source.
+        // Without it the run fails at `vacuum-candidate` and never reaches the
+        // stage this test is about.
+        let before_dir = run_dir.join("before");
+        ensure_new_directory(&before_dir).expect("create before backup dir");
+        copy_family_to_backup(&migration.db_path, &before_dir, &prepared.raw_before)
+            .expect("retain the before family");
+        verify_backup_family(&migration.db_path, &before_dir, &prepared.raw_before)
+            .expect("verify the retained before family");
         // Occupy the marker path so the pipeline fails exactly when it tries
         // to persist the commit-ready marker: the candidate is fully built and
         // attested, and no earlier stage has any reason to fail.
@@ -6795,6 +8063,7 @@ mod tests {
             &forecast,
             &marked_at,
             &run_dir,
+            &prepared.raw_before,
             &migration.write_authority,
             &mut failed_stage,
         )

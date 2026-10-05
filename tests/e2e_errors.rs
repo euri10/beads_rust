@@ -3121,6 +3121,8 @@ fn class_transition_workspace(open_capacity: usize) -> BrWorkspace {
     closed: [draft]
   class_transitions:
     - {{issue_type: bug, from: draft, to: open}}
+  entry_routes:
+    - {{label: triage, to: open}}
   required_fields:
     "draft -> open": [acceptance_criteria_present, transition_comment]
   gates:
@@ -3271,6 +3273,118 @@ fn e2e_class_transitions_preserve_initial_global_and_strict_routes() {
         ],
     );
     assert_class_transition_and_global_route(&workspace, &bug, &task);
+}
+
+#[test]
+fn e2e_entry_routes_require_both_existing_relation_and_configured_label() {
+    let workspace = class_transition_workspace(4);
+    let anchor = class_draft(
+        &workspace,
+        "Existing triage anchor",
+        None,
+        "- [ ] Anchor work remains",
+    );
+
+    // Neither half of the provenance pair is sufficient by itself.
+    assert_prerequisite_policy_refusal(
+        &workspace,
+        &[
+            "create",
+            "Label only cannot skip initial",
+            "--status",
+            "open",
+            "--labels",
+            "triage",
+            "--json",
+        ],
+        "VALIDATION_FAILED",
+        None,
+    );
+    assert_prerequisite_policy_refusal(
+        &workspace,
+        &[
+            "create",
+            "Relation only cannot skip initial",
+            "--status",
+            "open",
+            "--deps",
+            &format!("discovered-from:{anchor}"),
+            "--json",
+        ],
+        "VALIDATION_FAILED",
+        None,
+    );
+
+    // An external reference is not an existing tracked bead and cannot
+    // authorize the entry route even with the right label.
+    assert_prerequisite_policy_refusal(
+        &workspace,
+        &[
+            "create",
+            "External relation cannot authorize",
+            "--status",
+            "open",
+            "--labels",
+            "triage",
+            "--deps",
+            "related:external:ticket-42",
+            "--json",
+        ],
+        "VALIDATION_FAILED",
+        None,
+    );
+
+    // The configured label plus a relation that resolves to the existing
+    // anchor admits exactly the configured initial status.
+    let admitted = class_cli(
+        &workspace,
+        &[
+            "create",
+            "Provenance-backed triage bug",
+            "--status",
+            "open",
+            "--labels",
+            "TRIAGE",
+            "--deps",
+            &format!("discovered-from:{anchor}"),
+        ],
+    );
+    let admitted_id = admitted["id"].as_str().unwrap().to_owned();
+    assert_eq!(admitted["status"], "open");
+
+    let storage = SqliteStorage::open(&workspace.root.join(".beads/beads.db")).unwrap();
+    let stored = storage.get_issue(&admitted_id).unwrap().unwrap();
+    assert_eq!(stored.status.as_str(), "open");
+    let labels = storage.get_labels(&admitted_id).unwrap();
+    assert!(
+        labels
+            .iter()
+            .any(|label| label.eq_ignore_ascii_case("triage")),
+        "{labels:?}"
+    );
+    let dependencies = storage.get_dependencies(&admitted_id).unwrap();
+    assert!(
+        dependencies.iter().any(|dependency| dependency == &anchor),
+        "{dependencies:?}"
+    );
+    drop(storage);
+
+    assert_prerequisite_policy_refusal(
+        &workspace,
+        &[
+            "create",
+            "Route target is exact",
+            "--status",
+            "planned",
+            "--labels",
+            "triage",
+            "--deps",
+            &format!("discovered-from:{anchor}"),
+            "--json",
+        ],
+        "VALIDATION_FAILED",
+        None,
+    );
 }
 
 fn assert_class_transition_and_global_route(workspace: &BrWorkspace, bug: &str, task: &str) {
@@ -5769,4 +5883,62 @@ fn e2e_docs_shaped_mistakes_have_actionable_hints() {
     let message = error["message"].as_str().unwrap();
     assert!(message.contains("--flush-only"), "message: {message}");
     assert_hint_flags_exist(&workspace, &["sync"], message, "sync_help");
+}
+
+/// GH #515: a misspelled `policy.yaml` key is ignored (beads_rust#302 keeps
+/// the load non-fatal), which silently disables the rule it was meant to
+/// configure. The notice used to be a `tracing::warn!` that release builds
+/// filter out at default verbosity (`run_br` pins `RUST_LOG=error` to match),
+/// so it must be printed on stderr directly, while `--json` stdout stays
+/// parseable and the command still succeeds.
+#[test]
+fn e2e_unknown_policy_key_warns_on_stderr_at_default_verbosity() {
+    let _log = common::test_log("e2e_unknown_policy_key_warns_on_stderr_at_default_verbosity");
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "unknown_policy_key_init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+    let issue = run_br(
+        &workspace,
+        ["create", "Typo probe"],
+        "unknown_policy_key_create",
+    );
+    assert!(issue.status.success(), "create failed: {}", issue.stderr);
+    let id = parse_created_id(&issue.stdout);
+
+    fs::write(
+        workspace.root.join(".beads").join("policy.yaml"),
+        "close_policy:\n  require_close_reasn: {enabled: true, min_length: 40}\nworkflow:\n  strickt: true\n",
+    )
+    .expect("write policy with misspelled keys");
+
+    let close = run_br(
+        &workspace,
+        ["close", &id, "--reason", "ok", "--json"],
+        "unknown_policy_key_close",
+    );
+    assert!(
+        close.status.success(),
+        "unknown keys must stay non-fatal (beads_rust#302): {}",
+        close.stderr
+    );
+    let payload = extract_json_payload(&close.stdout);
+    serde_json::from_str::<Value>(&payload).expect("stdout stays parseable JSON");
+    for key in ["close_policy.require_close_reasn", "workflow.strickt"] {
+        assert!(
+            close.stderr.contains(key),
+            "stderr must name the unknown key {key}, got: {}",
+            close.stderr
+        );
+    }
+    assert!(
+        !close.stdout.contains("require_close_reasn"),
+        "the warning must not leak into JSON stdout: {}",
+        close.stdout
+    );
+    assert_eq!(
+        close.stderr.matches("require_close_reasn").count(),
+        1,
+        "the warning is printed once per invocation, got: {}",
+        close.stderr
+    );
 }

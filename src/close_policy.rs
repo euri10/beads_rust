@@ -21,7 +21,7 @@ use crate::error::{BeadsError, Result};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Default file name for the policy document inside `.beads/`.
 pub const POLICY_FILE_NAME: &str = "policy.yaml";
@@ -41,8 +41,8 @@ pub const ENV_MODEL: &str = "BR_MODEL";
 /// path (even `--bypass-policy` couldn't help because the parse fires
 /// before bypass logic runs). See beads_rust#302.
 ///
-/// Unknown fields surface via [`load_for_beads_dir`], which emits a
-/// `tracing::warn!` listing every unknown key it discovered. Operators
+/// Unknown fields surface via [`load_for_beads_dir`], which prints a
+/// `warning:` line on stderr listing every unknown key it discovered (GH #515). Operators
 /// who want strict parsing back can wire up a future `--strict-policy`
 /// flag (out of scope for the #302 fix).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,8 +76,8 @@ const fn default_true() -> bool {
 
 /// Close-time policy gates.
 ///
-/// Unknown fields are tolerated and surfaced via `tracing::warn!` at load
-/// time (see `PolicyDocument` doc-comment and beads_rust#302).
+/// Unknown fields are tolerated and surfaced as a stderr warning at load
+/// time (see `PolicyDocument` doc-comment, beads_rust#302 and #515).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ClosePolicy {
@@ -195,6 +195,22 @@ pub struct Workflow {
     /// are accepted. Matching is exact and case-insensitive.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub class_transitions: Vec<ClassTransition>,
+    /// Additive create-time entry routes (GitHub #503). A route can admit a
+    /// non-default initial status only when the prospective issue carries the
+    /// configured label AND at least one parent/dependency resolves to an
+    /// existing issue. Global `transitions.initial` remains authoritative for
+    /// ordinary creates; these rules are narrow provenance-backed exceptions.
+    ///
+    /// ```yaml
+    /// entry_routes:
+    ///   - {label: bug, to: open}
+    ///   - {label: follow-up, to: in_planning}
+    /// ```
+    ///
+    /// Status and label matching are case-insensitive. No hardcoded status
+    /// names are implied by this feature.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entry_routes: Vec<EntryRoute>,
     /// Per-transition gate rules (issue #312, layer 2). A map of
     /// `"from -> to"` (the transition the gates guard) to the set of gate
     /// conditions required before that move is allowed.
@@ -265,6 +281,20 @@ pub struct ClassTransition {
     /// Exact existing status; reserved global sources and wildcards are forbidden.
     pub from: String,
     /// Exact target status, still subject to ordinary status and transition gates.
+    pub to: String,
+}
+
+/// One provenance-backed exception to the global initial-status rule (GH #503).
+///
+/// The relation requirement is intentionally not configurable: an entry route
+/// exists specifically to let triage/follow-up work skip entry ceremony only
+/// when the new issue remains anchored to existing tracked work.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EntryRoute {
+    /// Prospective label required on the new issue.
+    pub label: String,
+    /// Initial status this label may enter when an existing relation is present.
     pub to: String,
 }
 
@@ -1048,8 +1078,10 @@ impl Workflow {
     /// Compute the set of gates required to move `from -> to` for an issue with
     /// the given `labels` and `priority`. Combines `require_all` (always) with
     /// any matching `require_if` entries. Returns an empty vec when no rule
-    /// guards the transition. De-duplicated by gate id, preserving source
-    /// order (require_all first, then require_if).
+    /// guards the transition. De-duplicated by gate id, preserving first-seen
+    /// order (require_all first, then require_if). Repeated `min_reviewers`
+    /// thresholds take their maximum, independent of declaration order; a
+    /// matching condition can strengthen, but never lower, the baseline.
     #[must_use]
     pub fn required_gates_for(
         &self,
@@ -1062,20 +1094,26 @@ impl Workflow {
             return Vec::new();
         };
         let mut out: Vec<GateSpec> = Vec::new();
-        let push_unique = |spec: &GateSpec, out: &mut Vec<GateSpec>| {
-            if !out
-                .iter()
-                .any(|seen| seen.id().eq_ignore_ascii_case(spec.id()))
+        let merge_required = |spec: &GateSpec, out: &mut Vec<GateSpec>| {
+            if let Some(existing) = out
+                .iter_mut()
+                .find(|seen| seen.id().eq_ignore_ascii_case(spec.id()))
             {
+                if let (GateSpec::MinReviewers(current), GateSpec::MinReviewers(required)) =
+                    (existing, spec)
+                {
+                    *current = (*current).max(*required);
+                }
+            } else {
                 out.push(spec.clone());
             }
         };
         for spec in &rule.require_all {
-            push_unique(spec, &mut out);
+            merge_required(spec, &mut out);
         }
         for conditional in &rule.require_if {
             if conditional_matches(conditional, labels, priority) {
-                push_unique(&conditional.gate, &mut out);
+                merge_required(&conditional.gate, &mut out);
             }
         }
         out
@@ -1637,6 +1675,72 @@ impl Workflow {
     #[must_use]
     pub fn transitions_enforced(&self) -> bool {
         self.strict && !self.transitions.is_empty()
+    }
+
+    /// Whether a create may use a provenance-backed exception to the global
+    /// `initial` transition rule (GitHub #503).
+    ///
+    /// A matching label by itself is never enough: the caller must already
+    /// have proved that at least one requested parent/dependency resolves to an
+    /// existing issue. This keeps the exception auditable and prevents a label
+    /// typo from silently widening initial admission.
+    #[must_use]
+    pub fn allows_entry_route(
+        &self,
+        to: &str,
+        labels: &[String],
+        has_existing_relation: bool,
+    ) -> bool {
+        has_existing_relation
+            && self.entry_routes.iter().any(|route| {
+                route.to.eq_ignore_ascii_case(to)
+                    && labels
+                        .iter()
+                        .any(|label| label.eq_ignore_ascii_case(&route.label))
+            })
+    }
+
+    /// Validate provenance-backed create entry routes at policy-load time.
+    ///
+    /// # Errors
+    ///
+    /// Rejects empty/control-bearing labels or targets, duplicate
+    /// case-insensitive label/target pairs, and targets outside a configured
+    /// strict status vocabulary.
+    pub fn validate_entry_routes(&self) -> Result<()> {
+        let invalid = |reason| BeadsError::validation("workflow.entry_routes", reason);
+        if !self.entry_routes.is_empty()
+            && (!self.transitions_enforced() || self.transitions_from(TRANSITION_INITIAL).is_none())
+        {
+            return Err(invalid(
+                "entry routes require strict workflow transition enforcement and an explicit non-empty transitions.initial rule; without that gate there is no initial admission to narrow"
+                    .to_string(),
+            ));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for (index, route) in self.entry_routes.iter().enumerate() {
+            for (field, value) in [("label", route.label.as_str()), ("to", route.to.as_str())] {
+                if value.is_empty() || value.trim() != value || value.chars().any(char::is_control)
+                {
+                    return Err(invalid(format!(
+                        "rule {index} {field} must be a non-empty literal without outer whitespace or control characters"
+                    )));
+                }
+            }
+            if self.is_enforced() && !self.allows(&route.to) {
+                return Err(invalid(format!(
+                    "rule {index} target '{}' is not declared in workflow.statuses",
+                    route.to
+                )));
+            }
+            let key = (route.label.to_lowercase(), route.to.to_lowercase());
+            if !seen.insert(key) {
+                return Err(invalid(format!(
+                    "rule {index} duplicates the same label/target pair case-insensitively"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Validate opt-in class edges without changing the global workflow graph.
@@ -2810,11 +2914,14 @@ fn parse_unchecked_box(line: &str) -> Option<String> {
 /// is loss of typo-at-parse-time detection, but the cost (full project
 /// close-pathway outage from one typo) was much worse.
 ///
-/// Unknown fields are surfaced exactly once per load via
-/// [`detect_unknown_policy_fields`] and emitted as a `tracing::warn!`
-/// event. The warning lists every unknown path with a dotted scope
+/// Unknown fields are detected on every load via
+/// [`detect_unknown_policy_fields`] and printed as a `warning:` line on
+/// stderr, once per distinct unknown-key set per process (GH #515: a `tracing::warn!` event was
+/// filtered out of release builds at default verbosity, so typos went
+/// unnoticed). The warning lists every unknown path with a dotted scope
 /// (e.g. `close_policy.require_new_experimental_field`) so operators
-/// can find typos without re-reading the file.
+/// can find typos without re-reading the file; `br doctor` reports the
+/// same list as the `policy.unknown_keys` check.
 ///
 /// # Errors
 ///
@@ -2831,6 +2938,7 @@ pub fn load_for_beads_dir(beads_dir: &Path) -> Result<PolicyDocument> {
     document.workflow.validate_capacity()?;
     document.workflow.validate_required_fields()?;
     document.workflow.validate_class_transitions()?;
+    document.workflow.validate_entry_routes()?;
 
     // Re-parse the raw YAML into a free-form value tree so we can diff it
     // against the typed schema and surface unknown fields without failing
@@ -2841,18 +2949,52 @@ pub fn load_for_beads_dir(beads_dir: &Path) -> Result<PolicyDocument> {
     if let Ok(raw_value) = serde_yml::from_str::<serde_yml::Value>(&raw) {
         let unknown = detect_unknown_policy_fields(&raw_value);
         if !unknown.is_empty() {
-            tracing::warn!(
-                policy_path = %path.display(),
-                unknown_fields = ?unknown,
-                "policy.yaml contains {} unknown field(s) under close_policy structs; \
-                 these were ignored (beads_rust#302). Check for typos: {}",
-                unknown.len(),
-                unknown.join(", "),
-            );
+            warn_unknown_policy_fields_once(&path, &unknown);
         }
     }
 
     Ok(document)
+}
+
+/// Render the operator-facing notice for unknown `policy.yaml` keys.
+#[must_use]
+pub fn unknown_policy_fields_message(policy_path: &Path, unknown: &[String]) -> String {
+    format!(
+        "{} has {} unknown key(s) that br ignores, so the rules they were meant to \
+         configure are NOT enforced: {}. Check for typos (run `br doctor` for details).",
+        policy_path.display(),
+        unknown.len(),
+        unknown.join(", "),
+    )
+}
+
+/// Surface unknown `policy.yaml` keys on stderr at default verbosity
+/// (GH #515). The #302 notice used `tracing::warn!`, which release builds
+/// filter out unless `-v` is given, so a misspelled key silently disabled
+/// its rule. stderr keeps `--json`/`--format toon` stdout parseable. Printed
+/// once per distinct (policy file, unknown-key set) per process: commands
+/// load the policy several times per invocation, and a long-running MCP
+/// server should re-warn only when the set of unknown keys changes.
+fn warn_unknown_policy_fields_once(policy_path: &Path, unknown: &[String]) {
+    type Seen = std::collections::HashSet<(PathBuf, Vec<String>)>;
+    static WARNED: std::sync::OnceLock<std::sync::Mutex<Seen>> = std::sync::OnceLock::new();
+    let first_time = WARNED
+        .get_or_init(Default::default)
+        .lock()
+        .map_or(true, |mut warned| {
+            warned.insert((policy_path.to_path_buf(), unknown.to_vec()))
+        });
+    tracing::debug!(
+        policy_path = %policy_path.display(),
+        unknown_fields = ?unknown,
+        "policy.yaml contains unknown field(s) (beads_rust#302, #515)"
+    );
+    if first_time {
+        eprintln!(
+            "warning: {}",
+            unknown_policy_fields_message(policy_path, unknown)
+        );
+    }
 }
 
 /// Walk a parsed `policy.yaml` value tree and collect dotted paths to any
@@ -2896,6 +3038,22 @@ enum PolicyNode {
     Workflow,
     /// `workflow.status_groups:` block (issue #354).
     StatusGroups,
+    /// `workflow.gates:` map. Its keys are free-form `"from -> to"`
+    /// transitions, so every key is accepted and each value is a gate rule.
+    Gates,
+    /// One `workflow.gates."<from> -> <to>":` rule.
+    GateRule,
+    /// `require_if:` list inside a gate rule; each element is a conditional
+    /// gate.
+    ConditionalGateList,
+    /// One `require_if` entry.
+    ConditionalGate,
+    /// `require_all:` list; each element is a gate spec.
+    GateSpecList,
+    /// One gate spec. A bare name is a scalar; the map form accepts only
+    /// `min_reviewers`, and `GateSpec` silently drops any sibling key such
+    /// as `{min_reviewers: 2, label: security}`.
+    GateSpec,
     /// Terminal scalar / list — descent stops here.
     Scalar,
 }
@@ -2933,11 +3091,13 @@ impl PolicyNode {
                 ("statuses", Self::Scalar),
                 ("transitions", Self::Scalar),
                 ("class_transitions", Self::Scalar),
-                // The gate rules are a free-form map of `"from -> to"` keys to
-                // gate specs; we don't descend into them for unknown-field
-                // detection (their shape is validated at parse time by the
-                // typed `GateRule`/`GateSpec` deserialisers).
-                ("gates", Self::Scalar),
+                ("entry_routes", Self::Scalar),
+                // `GateRule` and `ConditionalGate` are `serde(default)` without
+                // `deny_unknown_fields`, so a misspelled `require_all` /
+                // `require_if` / `label` / `priority` / `gate` parses fine and
+                // silently drops the gate; descend so it is reported (GH #515).
+                // `GateSpec` itself rejects unknown map keys at parse time.
+                ("gates", Self::Gates),
                 ("required_fields", Self::Scalar),
                 ("status_groups", Self::StatusGroups),
                 // Capacity owns a strict typed schema with
@@ -2947,7 +3107,18 @@ impl PolicyNode {
                 ("capacity", Self::Scalar),
             ],
             Self::StatusGroups => &[("ready", Self::Scalar)],
-            Self::Scalar => &[],
+            Self::GateRule => &[
+                ("require_all", Self::GateSpecList),
+                ("require_if", Self::ConditionalGateList),
+            ],
+            Self::ConditionalGate => &[
+                ("label", Self::Scalar),
+                ("priority", Self::Scalar),
+                ("gate", Self::GateSpec),
+            ],
+            Self::GateSpec => &[(GATE_MIN_REVIEWERS, Self::Scalar)],
+            // Free-form keys / sequences: handled directly by the walker.
+            Self::Gates | Self::ConditionalGateList | Self::GateSpecList | Self::Scalar => &[],
         }
     }
 }
@@ -2958,8 +3129,33 @@ fn walk_policy_node(
     scope: &str,
     out: &mut Vec<String>,
 ) {
-    if matches!(node, PolicyNode::Scalar) {
-        return;
+    match node {
+        PolicyNode::Scalar => return,
+        PolicyNode::ConditionalGateList | PolicyNode::GateSpecList => {
+            let element = if matches!(node, PolicyNode::GateSpecList) {
+                PolicyNode::GateSpec
+            } else {
+                PolicyNode::ConditionalGate
+            };
+            if let Some(items) = value.as_sequence() {
+                for (index, item) in items.iter().enumerate() {
+                    walk_policy_node(item, element, &format!("{scope}[{index}]"), out);
+                }
+            }
+            return;
+        }
+        PolicyNode::Gates => {
+            if let Some(map) = value.as_mapping() {
+                for (key, sub) in map {
+                    if let Some(key_str) = key.as_str() {
+                        let path = format!("{scope}.\"{key_str}\"");
+                        walk_policy_node(sub, PolicyNode::GateRule, &path, out);
+                    }
+                }
+            }
+            return;
+        }
+        _ => {}
     }
     let Some(map) = value.as_mapping() else {
         return;
@@ -3014,6 +3210,60 @@ mod tests {
         assert_eq!(
             workflow.ready_status_group(),
             vec!["open".to_string(), "rework".to_string()]
+        );
+    }
+
+    #[test]
+    fn entry_routes_require_relation_and_match_label_and_target() {
+        let raw = r"workflow:
+  strict: true
+  statuses: [draft, planning, open]
+  transitions:
+    initial: [draft]
+  entry_routes:
+    - {label: bug, to: open}
+    - {label: follow-up, to: planning}
+";
+        let document: PolicyDocument = serde_yml::from_str(raw).unwrap();
+        let workflow = &document.workflow;
+        workflow.validate_entry_routes().unwrap();
+        assert!(workflow.allows_entry_route("OPEN", &["Bug".to_string()], true));
+        assert!(workflow.allows_entry_route(
+            "planning",
+            &["triage".to_string(), "FOLLOW-UP".to_string()],
+            true
+        ));
+        assert!(!workflow.allows_entry_route("open", &["bug".to_string()], false));
+        assert!(!workflow.allows_entry_route("open", &["task".to_string()], true));
+        assert!(!workflow.allows_entry_route("draft", &["bug".to_string()], true));
+
+        let value: serde_yml::Value = serde_yml::from_str(raw).unwrap();
+        assert!(
+            detect_unknown_policy_fields(&value).is_empty(),
+            "entry_routes must be a canonical policy key"
+        );
+
+        let mut invalid = workflow.clone();
+        invalid.entry_routes[0].to = "missing".to_string();
+        assert!(invalid.validate_entry_routes().is_err());
+        invalid.entry_routes[0].to = "open".to_string();
+        invalid.entry_routes.push(EntryRoute {
+            label: "BUG".to_string(),
+            to: "OPEN".to_string(),
+        });
+        assert!(invalid.validate_entry_routes().is_err());
+
+        let mut no_initial = workflow.clone();
+        no_initial.transitions.remove(TRANSITION_INITIAL);
+        assert!(
+            no_initial.validate_entry_routes().is_err(),
+            "entry routes without an initial gate would be misleading"
+        );
+        let mut advisory = workflow.clone();
+        advisory.strict = false;
+        assert!(
+            advisory.validate_entry_routes().is_err(),
+            "entry routes require enforced transitions"
         );
     }
 
@@ -4133,7 +4383,7 @@ close_policy:
         );
         assert_table_covers(
             PolicyNode::Workflow,
-            &field_names_of(&class_transition_workflow()),
+            &field_names_of(&representative_workflow()),
             "Workflow",
         );
     }
@@ -4210,7 +4460,7 @@ close_policy:
         );
         assert_no_stale(
             PolicyNode::Workflow,
-            &field_names_of(&class_transition_workflow()),
+            &field_names_of(&representative_workflow()),
             "Workflow",
         );
     }
@@ -4339,6 +4589,44 @@ workflow:
         let raw: serde_yml::Value = serde_yml::from_str(yaml).unwrap();
         let unknown = detect_unknown_policy_fields(&raw);
         assert_eq!(unknown, vec!["workflow.statusses".to_string()]);
+    }
+
+    /// GH #515: `GateRule` / `ConditionalGate` tolerate unknown keys, so a
+    /// typo inside `workflow.gates` silently drops the gate unless the walker
+    /// descends into the free-form transition map and the `require_if` list.
+    #[test]
+    fn detect_unknown_policy_fields_walks_workflow_gates() {
+        let yaml = r#"
+workflow:
+  gates:
+    "in_review -> closed":
+      require_al: [ci_green]        # typo: should be require_all
+      require_if:
+        - label: security-sensitive
+          gate: security_sign_off
+        - priorty: [0, 1]           # typo: should be priority
+          gat: security_sign_off    # typo: should be gate
+    "open -> in_progress":
+      require_all: [triage_ok, {min_reviewers: 2, label: security}]
+      require_if:
+        - label: urgent
+          priority: [0]
+          gate: {min_reviewers: 1, lable: urgent}
+"#;
+        let raw: serde_yml::Value = serde_yml::from_str(yaml).unwrap();
+        // The typed parse accepts the typos (that is the silent failure).
+        serde_yml::from_str::<PolicyDocument>(yaml).expect("typos parse");
+        let unknown = detect_unknown_policy_fields(&raw);
+        assert_eq!(
+            unknown,
+            vec![
+                "workflow.gates.\"in_review -> closed\".require_al".to_string(),
+                "workflow.gates.\"in_review -> closed\".require_if[1].gat".to_string(),
+                "workflow.gates.\"in_review -> closed\".require_if[1].priorty".to_string(),
+                "workflow.gates.\"open -> in_progress\".require_all[1].label".to_string(),
+                "workflow.gates.\"open -> in_progress\".require_if[0].gate.lable".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -5103,6 +5391,17 @@ workflow:
         assert!(detect_unknown_policy_fields(&raw).is_empty());
     }
 
+    /// A workflow that serialises every optional table the policy parser
+    /// knows about; empty ones are skipped when serialising.
+    fn representative_workflow() -> Workflow {
+        let mut workflow = class_transition_workflow();
+        workflow.entry_routes.push(EntryRoute {
+            label: "bug".to_string(),
+            to: "open".to_string(),
+        });
+        workflow
+    }
+
     fn class_transition_workflow() -> Workflow {
         let workflow: Workflow = serde_yml::from_str(
             r"strict: true
@@ -5514,6 +5813,205 @@ gates:
         gate: p0_sign_off
 "#;
         serde_yml::from_str(yaml).expect("parse gate workflow")
+    }
+
+    fn reviewer_escalation_workflow() -> Workflow {
+        let yaml = r#"
+strict: true
+gates:
+  "in_review -> closed":
+    require_all:
+      - min_reviewers: 1
+    require_if:
+      - label: auth
+        gate: {min_reviewers: 2}
+      - label: security
+        gate: {min_reviewers: 3}
+      - priority: [0, 1]
+        gate: {min_reviewers: 4}
+      - label: restricted
+        priority: [0]
+        gate: {min_reviewers: 8}
+"#;
+        serde_yml::from_str(yaml).expect("parse reviewer escalation workflow")
+    }
+
+    #[test]
+    fn required_gates_min_reviewers_only_matching_rules_escalate() {
+        let workflow = reviewer_escalation_workflow();
+        let cases: &[(&[&str], i32, u32)] = &[
+            (&[], 2, 1),
+            (&["unrelated"], 2, 1),
+            (&["auth"], 2, 2),
+            (&["SECURITY"], 2, 3),
+            (&["auth", "security"], 2, 3),
+            (&[], 0, 4),
+            (&["security"], 1, 4),
+            (&["auth", "security"], 0, 4),
+            (&["restricted"], 2, 1),
+            (&["restricted"], 1, 4),
+            (&["restricted"], 0, 8),
+        ];
+        for (labels, priority, required) in cases {
+            let labels: Vec<String> = labels.iter().map(ToString::to_string).collect();
+            assert_eq!(
+                workflow.required_gates_for("in_review", "closed", &labels, *priority),
+                vec![GateSpec::MinReviewers(*required)],
+                "labels={labels:?}, priority={priority}"
+            );
+        }
+        assert!(
+            workflow
+                .required_gates_for("open", "closed", &["security".to_string()], 0)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn required_gates_min_reviewers_is_order_independent() {
+        let labels = vec!["auth".to_string(), "security".to_string()];
+        let permutations = [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ];
+        for baseline in [None, Some(0), Some(1), Some(4), Some(5), Some(u32::MAX)] {
+            for order in permutations {
+                let mut workflow = reviewer_escalation_workflow();
+                let rule = workflow.gates.get_mut("in_review -> closed").unwrap();
+                let conditionals = rule.require_if.clone();
+                rule.require_all = baseline.into_iter().map(GateSpec::MinReviewers).collect();
+                rule.require_if = order
+                    .into_iter()
+                    .map(|index| conditionals[index].clone())
+                    .collect();
+                // This stronger rule must not count: its label does not match.
+                rule.require_if.push(conditionals[3].clone());
+                assert_eq!(
+                    workflow.required_gates_for("in_review", "closed", &labels, 0),
+                    vec![GateSpec::MinReviewers(baseline.unwrap_or(0).max(4))],
+                    "baseline={baseline:?}, conditional order={order:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn required_gates_min_reviewers_merges_unconditional_thresholds_in_place() {
+        for counts in [
+            [0, 0, 0],
+            [1, 3, 2],
+            [3, 2, 1],
+            [2, 1, 3],
+            [2, 2, 2],
+            [0, u32::MAX, 1],
+            [u32::MAX, 1, 0],
+        ] {
+            let [first, second, third] = counts;
+            let workflow = Workflow {
+                gates: std::collections::BTreeMap::from([(
+                    "in_review -> closed".to_string(),
+                    GateRule {
+                        require_all: vec![
+                            GateSpec::Named("CI_GREEN".to_string()),
+                            GateSpec::MinReviewers(first),
+                            GateSpec::Named("docs_ready".to_string()),
+                            GateSpec::MinReviewers(second),
+                            GateSpec::Named("ci_green".to_string()),
+                            GateSpec::MinReviewers(third),
+                        ],
+                        require_if: vec![
+                            ConditionalGate {
+                                gate: GateSpec::Named("DOCS_READY".to_string()),
+                                ..Default::default()
+                            },
+                            ConditionalGate {
+                                gate: GateSpec::Named("security_sign_off".to_string()),
+                                ..Default::default()
+                            },
+                        ],
+                    },
+                )]),
+                ..Default::default()
+            };
+            assert_eq!(
+                workflow.required_gates_for("in_review", "closed", &[], 2),
+                vec![
+                    GateSpec::Named("CI_GREEN".to_string()),
+                    GateSpec::MinReviewers(first.max(second).max(third)),
+                    GateSpec::Named("docs_ready".to_string()),
+                    GateSpec::Named("security_sign_off".to_string()),
+                ],
+                "thresholds={counts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn evaluate_gates_min_reviewers_enforces_escalated_threshold() {
+        let workflow = reviewer_escalation_workflow();
+        let labels = vec!["auth".to_string(), "security".to_string()];
+        let results: Vec<GateResult> = ["reviewer:alice", "reviewer:bob", "reviewer:carol"]
+            .into_iter()
+            .map(|provider| GateResult {
+                gate: GATE_MIN_REVIEWERS.to_string(),
+                provider: provider.to_string(),
+                passed: true,
+                note: None,
+            })
+            .collect();
+        for count in 0..=results.len() {
+            let violations = evaluate_gates(
+                &workflow,
+                "bd-513",
+                "in_review",
+                "closed",
+                &labels,
+                2,
+                &results[..count],
+            );
+            if count == 3 {
+                assert!(violations.is_empty(), "{violations:?}");
+            } else {
+                assert_eq!(violations.len(), 1, "{count} reviewers: {violations:?}");
+                assert_eq!(violations[0].gate, "gate_min_reviewers");
+                let detail = violations[0].detail.as_ref().unwrap();
+                assert_eq!(detail["required"], serde_json::json!(3));
+                assert_eq!(detail["actual"], serde_json::json!(count));
+            }
+        }
+        // Without either sensitive label, one reviewer still satisfies the baseline.
+        assert!(
+            evaluate_gates(
+                &workflow,
+                "bd-513",
+                "in_review",
+                "closed",
+                &[],
+                2,
+                &results[..1],
+            )
+            .is_empty()
+        );
+        // Repeated reports are not an extra reviewer toward the escalated gate.
+        let duplicates = [results[0].clone(), results[0].clone(), results[1].clone()];
+        let violations = evaluate_gates(
+            &workflow,
+            "bd-513",
+            "in_review",
+            "closed",
+            &labels,
+            2,
+            &duplicates,
+        );
+        assert_eq!(violations.len(), 1);
+        assert_eq!(
+            violations[0].detail.as_ref().unwrap()["actual"],
+            serde_json::json!(2)
+        );
     }
 
     #[test]

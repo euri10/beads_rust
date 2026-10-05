@@ -10,6 +10,28 @@ If I tell you to do something, even if it goes against what follows below, YOU M
 
 ---
 
+## RULE 0.5 - SUITE-WIDE RULES LIVE IN /data/projects/AGENTS.md
+
+The suite-wide rules in **`/data/projects/AGENTS.md`** bind you here too. Read it. Two sections
+are load-bearing for perf work and are NOT duplicated below, so they cannot drift out of sync:
+
+- **`## Named Reward-Hacking Patterns (ALL FORBIDDEN)`** — 12 named patterns, several already
+  observed in this suite: gate self-weakening (and the exact price of a legitimate gate fix),
+  proof-class inflation, golden regeneration reflex, commit-stream pumping, tautological tests,
+  easy-lever cherry-picking, close-pump abuse, scope-splitting, spec-editing as progress,
+  conformance metastasis, dependency smuggling, bench-path hardcoding.
+- **`### Work-Graph Discipline`** — JSONL is truth and `beads.db` is disposable, `br sync
+  --import-only` after every pull, single-writer on graph structure, closure on cited evidence
+  with blocker beads gated on their named probe, `br dep cycles` stays empty.
+
+The three that most often decide whether a number here is real: a **self-speedup is
+MAINTENANCE, not a win** — a win needs the incumbent live in the SAME invocation; **never
+weaken a gate to land a change**, and if a gate is genuinely defective, meet the evidence
+standard and publish the win/lose split of what the fix admits; and **reporting a loss is a
+success** — one line, revert, next lever, no retraction narrative.
+
+---
+
 ## RULE NUMBER 1: NO FILE DELETION
 
 **YOU ARE NEVER ALLOWED TO DELETE A FILE WITHOUT EXPRESS PERMISSION.** Even a new file that you yourself created, such as a test code file. You have a horrible track record of deleting critically important files or otherwise throwing away tons of expensive work. As a result, you have permanently lost any and all rights to determine that a file or folder should be deleted.
@@ -346,10 +368,13 @@ beads_rust/
 │   ├── health.rs                  # Workspace health vocabulary
 │   ├── inheritance.rs             # Inherited context (BR_INHERITED_CONTEXT)
 │   ├── franken_sync.rs            # Synchronous facade over the async FrankenSQLite engine API
+│   ├── franken_sync/
+│   │   └── wal_index.rs           # Narrow containment for the initialized zero-page WAL index (#507)
 │   ├── shutdown.rs                # Cooperative shutdown and exit_process
 │   ├── logging.rs                 # tracing-subscriber setup
 │   ├── cache.rs                   # DORMANT (zero references)
 │   ├── write_combining.rs         # DORMANT (design artifact; bench-only)
+│   ├── compaction_certificate_tests.rs # Differential controls for the #508 private-compaction failure (test-only module)
 │   └── release_public_key.bin     # Tracked Minisign public key; no code references it as of 2026-09-02 (release.yml carries the key inline)
 ├── tests/                         # Integration, conformance, property, regression, e2e_scripts/
 ├── benches/                       # Criterion benchmarks
@@ -475,9 +500,31 @@ format defaults and `TOON_DEFAULT_FORMAT` examples.
 br list --json | jq '.issues[0]'
 br ready --robot
 
+# BETTER for work selection - same rows, without the long free text
+br ready --brief --json
+
 # WRONG - output format may vary based on terminal state
 br list | head -1
 ```
+
+Note that `--robot` is an alias for `--json` and does not reduce payload size.
+For `br ready`, add `--brief` when you are choosing what to work on rather
+than reading issue bodies.
+
+For `br list`, the equivalent is `--fields`, which names the keys you want:
+
+```bash
+br list --json --fields id,title,status,priority,issue_type
+```
+
+`br list --json` has **no default limit**, so on a large tracker it returns
+every matching issue with every long field. `--fields` selects columns and
+never rows — same issues, same `total`/`has_more`, same page boundaries — and
+unselected long text is never serialized. Selecting only `id`, `title`,
+`status`, `priority`, `issue_type`, `labels`, `dependency_count` or
+`dependent_count` also lets `br list` read the narrow projection instead of
+hydrating full records. See `docs/CLI_REFERENCE.md` (the `list` command) for
+the full selectable-key list.
 
 JSON mode guarantees:
 - Stable schema (changes are versioned and documented)
@@ -504,13 +551,13 @@ RUST_LOG=error "$MCP_TARGET/release/br" serve --actor "${AGENT_NAME:-mcp}"
 Transport is stdio. Configure the MCP client to launch `br serve`; do not expect
 a TCP port or background daemon. Available tools are `list_issues`, `show_issue`,
 `create_issue`, `update_issue`, `close_issue`, `manage_dependencies`, and
-`project_overview`. Resources include `beads://project/info`,
+`project_overview`. Resources are `beads://project/info`,
 `beads://issue/{id}`, `beads://schema`, `beads://labels`,
 `beads://issues/ready`, `beads://issues/blocked`,
-`beads://issues/in_progress`, `beads://issues/deferred`,
-`beads://issues/bottlenecks`, `beads://graph/health`, and
-`beads://events/recent`. Guided prompts are `triage`, `status_report`,
-`plan_next_work`, and `polish_backlog`.
+`beads://issues/in_progress`, `beads://coordination/status`,
+`beads://issues/deferred`, `beads://issues/bottlenecks`,
+`beads://graph/health`, and `beads://events/recent`. Guided prompts are
+`triage`, `status_report`, `plan_next_work`, and `polish_backlog`.
 
 Safety model: MCP serve uses the same local SQLite/JSONL workspace as the CLI,
 never runs git, and does not listen on the network. Mutating tools acquire the
@@ -555,8 +602,16 @@ The label tells the doctor check + future audits that the closure has been triag
 
 1. **Pick ready work (Beads):**
    ```bash
-   br ready --json  # Choose highest priority, no blockers
+   br ready --brief --json  # Choose highest priority, no blockers
    ```
+
+   Use `--brief` for selection. It keeps id, title, status, priority, type and
+   timestamps and drops the long free-text fields, then you read the detail of
+   the one issue you picked with `br show <id>`. Without it, `description`
+   alone is about 89% of the payload: on a 10k-issue tracker
+   `br ready --json` returns roughly 1.2 MB, which is more tokens than most
+   agent contexts hold. `--brief` changes columns only, never which issues
+   come back, so it cannot hide ready work from you.
 
 2. **Reserve edit surface (Mail):**
    ```

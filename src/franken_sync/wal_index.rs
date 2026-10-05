@@ -1,0 +1,1954 @@
+//! Narrow containment for the initialized, zero-page WAL index in GitHub #507.
+//!
+//! This is not a general SQLite repairer. The writable identity-bound recovery
+//! open may quarantine this exact derived-cache signature, but only after
+//! acquiring both the engine namespace and SQLite's main-file lock range.
+//! Main/WAL/journal/certificate files are never rewritten or removed here.
+//! The surrounding doctor recovery workflow still owns the complete backup,
+//! private rehearsal, protected-byte comparison, and logical attestation.
+//!
+//! A read-only open only reports an advisory diagnosis. BusyRecovery by itself,
+//! differing salts, and a missing/short index are NOT quarantine authority.
+
+use std::fs::{self, File, OpenOptions, TryLockError};
+use std::io::{self, Read, Seek, Write};
+use std::path::{Path, PathBuf};
+
+use fsqlite_vfs::FileIdentity;
+use fsqlite_vfs::namespace::{NamespaceOpenIntent, PendingNamespaceOpen};
+use sha2::{Digest, Sha256};
+
+use super::FrankenError;
+
+/// Owns a SQLite-compatible exclusive main-file range lock. Its platform
+/// constructor lives in sync::db_inode_lock, the existing syscall boundary.
+/// Closing this owned descriptor releases its OFD lock; unrelated closes do not.
+pub struct RecoveryLock {
+    pub(crate) file: File,
+}
+
+fn sidecar(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+fn invalid(message: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+fn open_regular(path: &Path, writable: bool) -> io::Result<File> {
+    if !fs::symlink_metadata(path)?.file_type().is_file() {
+        return Err(invalid("WAL-index recovery refuses non-regular files"));
+    }
+    let mut options = OpenOptions::new();
+    options.read(true).write(writable);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(invalid(
+            "WAL-index recovery descriptor is not a regular file",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() != 1 {
+            return Err(invalid("WAL-index recovery refuses hard-linked files"));
+        }
+    }
+    Ok(file)
+}
+
+fn identity(file: &File) -> io::Result<FileIdentity> {
+    FileIdentity::from_file(file)?
+        .ok_or_else(|| invalid("WAL-index recovery cannot verify the file identity"))
+}
+
+fn verify_name(path: &Path, retained: &File) -> io::Result<()> {
+    if identity(&open_regular(path, false)?)? != identity(retained)? {
+        return Err(invalid("WAL-index recovery path changed identity"));
+    }
+    Ok(())
+}
+
+fn prefix<const N: usize>(path: &Path) -> io::Result<Option<[u8; N]>> {
+    let result: io::Result<[u8; N]> = (|| {
+        let mut bytes = [0; N];
+        open_regular(path, false)?.read_exact(&mut bytes)?;
+        Ok(bytes)
+    })();
+    match result {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::UnexpectedEof
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn be32(bytes: &[u8]) -> u32 {
+    u32::from_be_bytes(bytes.try_into().expect("fixed-width WAL field"))
+}
+
+fn checksum(bytes: &[u8], mut state: [u32; 2], big_endian: bool) -> [u32; 2] {
+    for pair in bytes.as_chunks::<8>().0 {
+        let word = |bytes: &[u8]| {
+            let bytes = bytes.try_into().expect("fixed-width checksum word");
+            if big_endian {
+                u32::from_be_bytes(bytes)
+            } else {
+                u32::from_le_bytes(bytes)
+            }
+        };
+        state[0] = state[0]
+            .wrapping_add(word(&pair[..4]))
+            .wrapping_add(state[1]);
+        state[1] = state[1]
+            .wrapping_add(word(&pair[4..]))
+            .wrapping_add(state[0]);
+    }
+    state
+}
+
+fn wal_layout(header: &[u8; 32]) -> io::Result<(u32, bool)> {
+    let magic = be32(&header[..4]);
+    let page_size = be32(&header[8..12]);
+    if !matches!(magic, 0x377f_0682 | 0x377f_0683)
+        || be32(&header[4..8]) != 3_007_000
+        || !(512..=65_536).contains(&page_size)
+        || !page_size.is_power_of_two()
+    {
+        return Err(invalid("invalid WAL header; refusing index quarantine"));
+    }
+    let big_endian = magic & 1 != 0;
+    if checksum(&header[..24], [0, 0], big_endian) != [be32(&header[24..28]), be32(&header[28..32])]
+    {
+        return Err(invalid(
+            "invalid WAL header checksum; refusing index quarantine",
+        ));
+    }
+    Ok((page_size, big_endian))
+}
+
+fn poisoned_headers(wal: &[u8; 32], shm: &[u8; 96]) -> bool {
+    // The WAL-index scalars are native endian; the salts are raw bytes copied
+    // from the big-endian WAL header. Never compare native-decoded index salts
+    // with big-endian-decoded WAL salts (a healthy little-endian index differs).
+    let version = u32::from_ne_bytes(shm[..4].try_into().expect("version field"));
+    wal_layout(wal).is_ok()
+        && matches!(version, 0 | 3_007_000)
+        && shm[..48] == shm[48..]
+        && shm[12] == 1
+        && shm[14..24].iter().all(|byte| *byte == 0)
+        && shm[32..40].iter().all(|byte| *byte == 0)
+}
+
+/// Whether this target's storage engine admits the database through the
+/// on-disk `-shm` WAL index.
+///
+/// On Unix frankensqlite memory-maps `-shm`, so its bytes decide admission and
+/// #507's poison can latch `BusyRecovery`. On Windows the engine keeps the WAL
+/// index in process-private memory rebuilt from the WAL on every open, and
+/// uses `-shm` only as a lock sidecar: it never reads the file's bytes and
+/// recreates a missing file on demand. There, neither a poison-shaped `-shm`
+/// (stock SQLite writes exactly that shape beside a header-only WAL) nor a
+/// missing one can affect admission, so nothing may be "recovered" (GH #520).
+pub const ENGINE_READS_ON_DISK_WAL_INDEX: bool = cfg!(unix);
+
+/// Whether this target can perform the identity-bound WAL-index quarantine:
+/// the POSIX open-file-description byte-range guard in
+/// `RecoveryLock::acquire` exists only on these targets (keep the two cfg
+/// lists identical). Elsewhere acquisition always fails as unsupported.
+pub const WAL_INDEX_QUARANTINE_SUPPORTED: bool = cfg!(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+));
+
+/// Whether ordinary startup may enter automatic WAL-index recovery. Both the
+/// engine must read the on-disk index *and* the quarantine must be possible;
+/// on other Unix targets (FreeBSD, NetBSD, ...) entering recovery could only
+/// fail as unsupported and wedge every command, so startup leaves the family
+/// to the engine and `br doctor migrate-schema recover` reports the
+/// limitation explicitly (GH #520 follow-up).
+pub const STARTUP_WAL_INDEX_RECOVERY: bool =
+    ENGINE_READS_ON_DISK_WAL_INDEX && WAL_INDEX_QUARANTINE_SUPPORTED;
+
+fn probe(path: &Path) -> io::Result<bool> {
+    probe_for_engine(path, ENGINE_READS_ON_DISK_WAL_INDEX)
+}
+
+fn probe_for_engine(path: &Path, engine_reads_on_disk_index: bool) -> io::Result<bool> {
+    if !engine_reads_on_disk_index {
+        return Ok(false);
+    }
+    let Some(wal) = prefix::<32>(&sidecar(path, "-wal"))? else {
+        return Ok(false);
+    };
+    let Some(shm) = prefix::<96>(&sidecar(path, "-shm"))? else {
+        return Ok(false);
+    };
+    Ok(poisoned_headers(&wal, &shm))
+}
+
+pub fn poisoned_index_present(path: &Path) -> io::Result<bool> {
+    probe(path)
+}
+
+/// [`poisoned_index_present`] for an engine that does (or does not) read the
+/// on-disk index, so both platform behaviors are testable on either host.
+pub fn poisoned_index_present_for_engine(
+    path: &Path,
+    engine_reads_on_disk_index: bool,
+) -> io::Result<bool> {
+    probe_for_engine(path, engine_reads_on_disk_index)
+}
+
+/// Whether `shm` is stock SQLite's initialized, unindexed empty WAL index:
+/// the header stock writes when it is the first connection to a family whose
+/// WAL holds no frames (bv, the sqlite3 shell). It has #507's zero-page shape,
+/// but a supported version, a valid native-order checksum, and no frame count.
+fn unindexed_empty_headers(wal: &[u8; 32], shm: &[u8; 96]) -> bool {
+    let native_big_endian = cfg!(target_endian = "big");
+    let native = |bytes: &[u8]| u32::from_ne_bytes(bytes.try_into().expect("u32 field"));
+    poisoned_headers(wal, shm)
+        && native(&shm[..4]) == 3_007_000
+        && shm[13] <= 1
+        && checksum(&shm[..40], [0, 0], native_big_endian)
+            == [native(&shm[40..44]), native(&shm[44..48])]
+}
+
+fn stock_empty_probe(path: &Path, engine_reads_on_disk_index: bool) -> io::Result<bool> {
+    if !engine_reads_on_disk_index {
+        return Ok(false);
+    }
+    let wal_path = sidecar(path, "-wal");
+    // Only a bare header: any frame (or partial frame) makes the empty index
+    // stale, and the engine then still requires recovery.
+    match fs::symlink_metadata(&wal_path) {
+        Ok(metadata) if metadata.file_type().is_file() && metadata.len() == 32 => {}
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    }
+    let Some(wal) = prefix::<32>(&wal_path)? else {
+        return Ok(false);
+    };
+    let Some(shm) = prefix::<96>(&sidecar(path, "-shm"))? else {
+        return Ok(false);
+    };
+    Ok(unindexed_empty_headers(&wal, &shm))
+}
+
+/// Whether the index beside `path` is stock SQLite's unindexed empty index
+/// beside a header-only WAL: #507's shape as every stock reader of the
+/// tracker (bv, the sqlite3 shell) leaves it. FrankenSQLite 0.4.6+ admits it
+/// for reads (fsqlite GH#431), so read-only commands read the live family
+/// instead of a private snapshot. The first commit through that index still
+/// fails with `BusyRecovery` on 0.4.7, so writable startup keeps rebuilding
+/// it ([`poisoned_index_present`] matches it too).
+///
+/// # Errors
+/// Returns an error when a family member exists but cannot be read.
+pub fn stock_empty_index_present(path: &Path) -> io::Result<bool> {
+    stock_empty_probe(path, ENGINE_READS_ON_DISK_WAL_INDEX)
+}
+
+/// Whether a settled `-shm` index can never admit a reader of this WAL: it
+/// was never initialized, or it describes another WAL generation or more
+/// frames than the WAL holds. The engine answers every one of these with
+/// "recovery required", which a read-only open cannot perform, so reads fail
+/// with `BusyRecovery` until a writable open rebuilds the index in place.
+///
+/// This is the state any engine that kept its index in process memory leaves
+/// behind: br 0.6.0 (fsqlite 0.3.x) never wrote the header, and when it runs
+/// against a family a newer br already opened, it restarts the WAL without
+/// updating the header the newer engine wrote (GH #521).
+///
+/// Only a quiescent header counts (both 48-byte copies identical); a torn or
+/// half-written header stays the engine's to classify.
+fn stale_headers(wal: &[u8; 32], shm: &[u8; 96], wal_frames: u64) -> bool {
+    let Ok((page_size, big_endian)) = wal_layout(wal) else {
+        return false;
+    };
+    if shm[..48] != shm[48..] {
+        return false;
+    }
+    match shm[12] {
+        0 => true,
+        1 => {
+            // szPage packs 65536 as 1; salts are raw big-endian WAL bytes.
+            let size_field = u16::from_ne_bytes([shm[14], shm[15]]);
+            let index_page_size = if size_field == 1 {
+                65_536
+            } else {
+                u32::from(size_field)
+            };
+            let max_frame = u32::from_ne_bytes(shm[16..20].try_into().expect("mxFrame field"));
+            index_page_size != page_size
+                || shm[13] != u8::from(big_endian)
+                || shm[32..40] != wal[16..24]
+                || u64::from(max_frame) > wal_frames
+        }
+        _ => false,
+    }
+}
+
+fn stale_probe_for_engine(path: &Path, engine_reads_on_disk_index: bool) -> io::Result<bool> {
+    if !engine_reads_on_disk_index {
+        return Ok(false);
+    }
+    let wal_path = sidecar(path, "-wal");
+    let Some(wal) = prefix::<32>(&wal_path)? else {
+        return Ok(false);
+    };
+    let Some(shm) = prefix::<96>(&sidecar(path, "-shm"))? else {
+        return Ok(false);
+    };
+    let Ok((page_size, _)) = wal_layout(&wal) else {
+        return Ok(false);
+    };
+    let wal_len = match fs::symlink_metadata(&wal_path) {
+        Ok(metadata) => metadata.len(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let wal_frames = wal_len.saturating_sub(32) / (u64::from(page_size) + 24);
+    Ok(stale_headers(&wal, &shm, wal_frames))
+}
+
+/// Whether the on-disk WAL index beside `path` is stale in a way only a
+/// writable open can repair (see [`stale_headers`]). Always false where the
+/// engine never reads the on-disk index (GH #520).
+///
+/// # Errors
+/// Returns an error when a family member exists but cannot be read.
+pub fn stale_index_present(path: &Path) -> io::Result<bool> {
+    stale_probe_for_engine(path, ENGINE_READS_ON_DISK_WAL_INDEX)
+}
+
+/// [`stale_index_present`] for an engine that does (or does not) read the
+/// on-disk index, so both platform behaviors are testable on either host.
+///
+/// # Errors
+/// Returns an error when a family member exists but cannot be read.
+pub fn stale_index_present_for_engine(
+    path: &Path,
+    engine_reads_on_disk_index: bool,
+) -> io::Result<bool> {
+    stale_probe_for_engine(path, engine_reads_on_disk_index)
+}
+
+pub(super) fn warn_if_poisoned(path: &str) {
+    if probe(Path::new(path)).unwrap_or(false) {
+        tracing::warn!(
+            database = path,
+            diagnostic = "WAL_INDEX_POISONED",
+            "initialized zero-page WAL index observed beside a valid WAL header; \
+             close database users, preserve the complete family, and run \
+             `br doctor migrate-schema recover` on a supported native Unix host. \
+             Do not rebuild from potentially stale JSONL or delete the WAL"
+        );
+    }
+}
+
+/// Conservative validation: require a complete checksummed WAL ending at a
+/// commit (or a header-only WAL). A partial, corrupt, or old-generation tail
+/// is retained for engine-level recovery, never silently discarded here.
+fn validate_wal(main: &mut File, wal: &mut File) -> io::Result<()> {
+    let mut database_header = [0; 100];
+    main.rewind()?;
+    main.read_exact(&mut database_header)?;
+    if &database_header[..16] != b"SQLite format 3\0" {
+        return Err(invalid("invalid main database header"));
+    }
+    let encoded = u16::from_be_bytes([database_header[16], database_header[17]]);
+    let database_page_size = if encoded == 1 {
+        65_536
+    } else {
+        u32::from(encoded)
+    };
+    let mut header = [0; 32];
+    wal.rewind()?;
+    wal.read_exact(&mut header)?;
+    let (page_size, big_endian) = wal_layout(&header)?;
+    if page_size != database_page_size {
+        return Err(invalid("WAL and main database page sizes differ"));
+    }
+    let frame_size = u64::from(page_size) + 24;
+    let length = wal.metadata()?.len();
+    if length < 32 || (length - 32) % frame_size != 0 {
+        return Err(invalid("partial WAL frame; refusing index quarantine"));
+    }
+    let mut frame = vec![0; usize::try_from(frame_size).map_err(|_| invalid("WAL frame size"))?];
+    let mut state = [be32(&header[24..28]), be32(&header[28..32])];
+    let mut committed = true;
+    for _ in 0..(length - 32) / frame_size {
+        wal.read_exact(&mut frame)?;
+        if frame[8..16] != header[16..24] || matches!(be32(&frame[..4]), 0 | u32::MAX) {
+            return Err(invalid(
+                "invalid WAL frame binding; refusing index quarantine",
+            ));
+        }
+        state = checksum(&frame[..8], state, big_endian);
+        state = checksum(&frame[24..], state, big_endian);
+        if state != [be32(&frame[16..20]), be32(&frame[20..24])] {
+            return Err(invalid(
+                "invalid WAL frame checksum; refusing index quarantine",
+            ));
+        }
+        committed = be32(&frame[4..8]) != 0;
+    }
+    if !committed {
+        return Err(invalid("uncommitted WAL tail; refusing index quarantine"));
+    }
+    Ok(())
+}
+
+fn hash_file(file: &mut File) -> io::Result<String> {
+    file.rewind()?;
+    let mut hash = Sha256::new();
+    let mut buffer = [0; 16 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            return Ok(crate::util::hex_encode(&hash.finalize()));
+        }
+        hash.update(&buffer[..count]);
+    }
+}
+
+fn sync_directory(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        File::open(path)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "directory synchronization unavailable",
+        ))
+    }
+}
+
+fn quarantine_name(from: &Path, to: &Path) -> io::Result<()> {
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
+    {
+        use rustix::fs::{CWD, RenameFlags, renameat_with};
+        // No unlink fallback: a filesystem without atomic no-replace support
+        // must retain the live cache instead of risking an evidence overwrite.
+        renameat_with(CWD, from, CWD, to, RenameFlags::NOREPLACE).map_err(io::Error::from)
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    )))]
+    {
+        let _ = (from, to);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "atomic WAL-index quarantine unavailable",
+        ))
+    }
+}
+
+/// Only the identity-bound writable recovery open calls this function. It
+/// returns false for every signature outside #507, preserving BusyRecovery's
+/// ordinary contention meaning. Failure after quarantine leaves a missing
+/// regenerable cache and retained evidence, never reinstalls poisoned state.
+#[allow(clippy::too_many_lines)]
+pub(super) fn quarantine_poisoned_index(
+    path: &str,
+    expected_identity: FileIdentity,
+) -> Result<bool, FrankenError> {
+    let requested = Path::new(path);
+    if !probe(requested)? {
+        return Ok(false);
+    }
+    let parent = requested
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent = fs::canonicalize(parent)?;
+    let path = parent.join(
+        requested
+            .file_name()
+            .ok_or_else(|| invalid("missing database filename"))?,
+    );
+    let main = open_regular(&path, true)?;
+    if identity(&main)? != expected_identity {
+        return Err(invalid("recovery database no longer matches the retained identity").into());
+    }
+    // Shared admission obtains both locks exclusively for a quiescent
+    // namespace; expected_identity=Some means we joined a live peer instead.
+    let pending = PendingNamespaceOpen::begin(&path, NamespaceOpenIntent::Shared)?;
+    if pending.expected_identity().is_some() {
+        return Err(FrankenError::BusyRecovery);
+    }
+    let mut locked = RecoveryLock::acquire(main).map_err(|error| match error {
+        TryLockError::WouldBlock => FrankenError::BusyRecovery,
+        TryLockError::Error(error) => error.into(),
+    })?;
+    verify_name(&path, &locked.file)?;
+    let _namespace = if pending.has_quiescent_record_bytes()? {
+        pending.bind_replacing_quiescent_record(expected_identity)?
+    } else {
+        pending.bind(expected_identity)?
+    };
+    let wal_path = sidecar(&path, "-wal");
+    let shm_path = sidecar(&path, "-shm");
+    let mut wal = open_regular(&wal_path, false)?;
+    let mut shm = open_regular(&shm_path, true)?;
+    let mut wal_header = [0; 32];
+    let mut shm_headers = [0; 96];
+    wal.read_exact(&mut wal_header)?;
+    shm.read_exact(&mut shm_headers)?;
+    if !poisoned_headers(&wal_header, &shm_headers) {
+        return Ok(false);
+    }
+    validate_wal(&mut locked.file, &mut wal)?;
+    let main_hash = hash_file(&mut locked.file)?;
+    let wal_hash = hash_file(&mut wal)?;
+    let shm_hash = hash_file(&mut shm)?;
+    // Preparation owns no unique forensic state yet: an ordinary error must
+    // not accumulate .br-wal-index-* directories on each retry (GH #523).
+    let scratch = tempfile::Builder::new()
+        .prefix(".br-wal-index-")
+        .tempdir_in(&parent)?;
+    let retained = scratch.path().to_path_buf();
+    let mut temporary = Some(scratch);
+    let destination = retained.join("poisoned-shm");
+    let operation = (|| -> io::Result<()> {
+        #[cfg(test)]
+        tests::fail_at_recovery_boundary("allocated")?;
+        let receipt = serde_json::json!({
+            "schema_version": "br.wal_index.quarantine.v1",
+            "database_path": path.display().to_string(),
+            "reason": "initialized-zero-page-wal-index",
+            "main_sha256": &main_hash,
+            "wal_sha256": &wal_hash,
+            "shm_sha256": &shm_hash,
+            "retained_index": destination.display().to_string(),
+            // Announces that a finished quarantine writes this marker, so
+            // retention never mistakes an unmarked one for a legacy success.
+            "completion_marker": QUARANTINE_COMPLETE,
+        });
+        let mut marker = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(retained.join(QUARANTINE_PREPARED))?;
+        marker.write_all(
+            serde_json::to_string_pretty(&receipt)
+                .map_err(io::Error::other)?
+                .as_bytes(),
+        )?;
+        marker.sync_all()?;
+        shm.sync_all()?;
+        sync_directory(&retained)?;
+        sync_directory(&parent)?;
+        #[cfg(test)]
+        tests::fail_at_recovery_boundary("prepared")?;
+        #[cfg(test)]
+        tests::crash_at_recovery_boundary("prepared");
+        verify_name(&path, &locked.file)?;
+        verify_name(&wal_path, &wal)?;
+        verify_name(&shm_path, &shm)?;
+        // Even inside this call's private directory, never clobber an entry.
+        let renamed = quarantine_name(&shm_path, &destination);
+        #[cfg(test)]
+        let renamed = renamed.and_then(|()| tests::fail_at_recovery_boundary("rename-result"));
+        // From the first possible transfer of evidence onward, retention is
+        // unconditional, even when rename reports an indeterminate failure.
+        // Only a definitely absent destination permits temporary cleanup.
+        if renamed.is_ok()
+            || !matches!(
+                fs::symlink_metadata(&destination),
+                Err(error) if error.kind() == io::ErrorKind::NotFound
+            )
+        {
+            let _ = temporary
+                .take()
+                .expect("quarantine preparation is owned")
+                .keep();
+        }
+        renamed?;
+        #[cfg(test)]
+        tests::fail_at_recovery_boundary("renamed")?;
+        #[cfg(test)]
+        tests::crash_at_recovery_boundary("renamed");
+        sync_directory(&retained)?;
+        sync_directory(&parent)?;
+        verify_name(&destination, &shm)?;
+        if hash_file(&mut locked.file)? != main_hash
+            || hash_file(&mut wal)? != wal_hash
+            || hash_file(&mut shm)? != shm_hash
+        {
+            return Err(invalid(
+                "recovery payload changed; inspect retained evidence before retrying",
+            ));
+        }
+        #[cfg(test)]
+        tests::fail_at_recovery_boundary("durable")?;
+        #[cfg(test)]
+        tests::crash_at_recovery_boundary("durable");
+        Ok(())
+    })();
+    if let Err(error) = operation {
+        let disposition = if let Some(scratch) = temporary {
+            match scratch.close() {
+                Ok(()) => "no index quarantined; temporary preparation removed".to_string(),
+                Err(cleanup) => format!(
+                    "no index quarantined; temporary preparation cleanup failed at {}: {cleanup}",
+                    retained.display()
+                ),
+            }
+        } else {
+            format!("evidence retained at {}", retained.display())
+        };
+        return Err(FrankenError::internal(format!(
+            "WAL-index quarantine did not complete: {error}; {disposition}"
+        )));
+    }
+    // Retention marker only: without it the directory is simply kept, so a
+    // failure to write it must not turn a verified quarantine into an error.
+    if let Err(error) = write_quarantine_complete(&retained, &destination) {
+        tracing::warn!(
+            retained = %retained.display(),
+            %error,
+            "could not mark the quarantined WAL index complete; it is kept indefinitely"
+        );
+    }
+    tracing::warn!(
+        database = %path.display(),
+        retained = %retained.display(),
+        "quarantined poisoned WAL index; main database and WAL preserved byte-for-byte"
+    );
+    Ok(true)
+}
+
+/// Prefix of the directory each quarantine retains beside the database.
+const QUARANTINE_PREFIX: &str = ".br-wal-index-";
+/// A quarantine directory renamed aside for removal; swept on the next prune.
+const QUARANTINE_PRUNING_PREFIX: &str = ".br-pruning-wal-index-";
+/// Written once a quarantine completed and its payload was verified.
+const QUARANTINE_COMPLETE: &str = "quarantine-complete.json";
+const QUARANTINE_PREPARED: &str = "prepared.json";
+const QUARANTINED_INDEX: &str = "poisoned-shm";
+
+fn write_quarantine_complete(retained: &Path, destination: &Path) -> io::Result<()> {
+    let receipt = serde_json::json!({
+        "schema_version": "br.wal_index.quarantine.v1",
+        "stage": "complete",
+        "retained_index": destination.display().to_string(),
+    });
+    let mut marker = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(retained.join(QUARANTINE_COMPLETE))?;
+    marker.write_all(
+        serde_json::to_string_pretty(&receipt)
+            .map_err(io::Error::other)?
+            .as_bytes(),
+    )?;
+    marker.sync_all()?;
+    sync_directory(retained)
+}
+
+/// Classify a `.br-wal-index-*` directory: `None` unless its receipt names
+/// the database at `database_path` (another database's, or an unreadable
+/// receipt, is neither counted nor removed); otherwise whether it is a
+/// finished quarantine that may be removed once old enough.
+///
+/// Finished means `quarantine-complete.json` is present, or, for directories
+/// br 0.7.3 and earlier wrote (their receipt names no `completion_marker`),
+/// that the directory holds
+/// exactly its receipt and the retained index, the index hashes to what the
+/// receipt recorded, and no recovery failure receipt names the directory.
+/// A partial or failed quarantine is evidence and is kept.
+fn quarantine_status(
+    dir: &Path,
+    database_path: &str,
+    failure_receipts: &[String],
+) -> io::Result<Option<bool>> {
+    let receipt = match fs::read(dir.join(QUARANTINE_PREPARED)) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let Ok(receipt) = serde_json::from_slice::<serde_json::Value>(&receipt) else {
+        return Ok(None);
+    };
+    if receipt
+        .get("database_path")
+        .and_then(serde_json::Value::as_str)
+        != Some(database_path)
+    {
+        return Ok(None);
+    }
+    Ok(Some(quarantine_is_finished(
+        dir,
+        &receipt,
+        failure_receipts,
+    )?))
+}
+
+fn quarantine_is_finished(
+    dir: &Path,
+    receipt: &serde_json::Value,
+    failure_receipts: &[String],
+) -> io::Result<bool> {
+    if fs::symlink_metadata(dir.join(QUARANTINE_COMPLETE)).is_ok_and(|meta| meta.is_file()) {
+        return Ok(true);
+    }
+    // A quarantine that announced the marker but never wrote it was
+    // interrupted or failed.
+    if receipt.get("completion_marker").is_some() {
+        return Ok(false);
+    }
+    let mut names = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        names.push(entry?.file_name());
+    }
+    names.sort();
+    // Sorted: "poisoned-shm" < "prepared.json".
+    if names != [QUARANTINED_INDEX, QUARANTINE_PREPARED] {
+        return Ok(false);
+    }
+    let index = dir.join(QUARANTINED_INDEX);
+    if !fs::symlink_metadata(&index)?.is_file() {
+        return Ok(false);
+    }
+    let Some(expected) = receipt
+        .get("shm_sha256")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Ok(false);
+    };
+    if hash_file(&mut File::open(&index)?)? != expected {
+        return Ok(false);
+    }
+    let name = dir.file_name().unwrap_or_default().to_string_lossy();
+    Ok(!failure_receipts
+        .iter()
+        .any(|receipt| receipt.contains(name.as_ref())))
+}
+
+/// Remove this database's finished WAL-index quarantine directories
+/// (`.br-wal-index-*` beside it) that are both outside the newest `keep` and
+/// older than `min_age`, by the time their receipt was written. Failed,
+/// partial and foreign directories are never removed (see
+/// [`quarantine_status`]); `failure_receipts` holds the text of every
+/// recovery failure receipt, which names the directory a failed quarantine
+/// retained. Returns the removed directories.
+///
+/// # Errors
+/// Returns an error when the database directory cannot be read.
+pub fn prune_quarantined_indexes(
+    db_path: &Path,
+    keep: usize,
+    min_age: std::time::Duration,
+    now: std::time::SystemTime,
+    failure_receipts: &[String],
+) -> io::Result<Vec<PathBuf>> {
+    let parent = db_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent = fs::canonicalize(parent)?;
+    let database_path = parent
+        .join(
+            db_path
+                .file_name()
+                .ok_or_else(|| invalid("missing database filename"))?,
+        )
+        .display()
+        .to_string();
+    let mut quarantines = Vec::new();
+    let mut doomed = Vec::new();
+    for entry in fs::read_dir(&parent)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if !file_type.is_dir() || file_type.is_symlink() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with(QUARANTINE_PRUNING_PREFIX) {
+            doomed.push(entry.path());
+            continue;
+        }
+        if !name.starts_with(QUARANTINE_PREFIX) {
+            continue;
+        }
+        let path = entry.path();
+        // A directory without a readable receipt counts toward nothing and
+        // stays (for example a quarantine still being prepared).
+        let Ok(receipt) = fs::symlink_metadata(path.join(QUARANTINE_PREPARED)) else {
+            continue;
+        };
+        let Ok(written) = receipt.modified() else {
+            continue;
+        };
+        if !receipt.is_file() {
+            continue;
+        }
+        let Some(finished) = quarantine_status(&path, &database_path, failure_receipts)? else {
+            continue;
+        };
+        quarantines.push((written, path, finished));
+    }
+    // Newest first; ties broken by name so the order is total.
+    quarantines.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1)));
+    let mut pruned = Vec::new();
+    for (written, path, finished) in quarantines.into_iter().skip(keep) {
+        let old_enough = now.duration_since(written).is_ok_and(|age| age >= min_age);
+        if !finished || !old_enough {
+            continue;
+        }
+        let Some(name) = path.file_name() else {
+            continue;
+        };
+        let mut aside = std::ffi::OsString::from(QUARANTINE_PRUNING_PREFIX);
+        aside.push(name.to_string_lossy().trim_start_matches(QUARANTINE_PREFIX));
+        let aside = parent.join(aside);
+        if let Err(error) = fs::rename(&path, &aside) {
+            tracing::warn!(dir = %path.display(), %error, "could not set aside old WAL-index quarantine");
+            continue;
+        }
+        doomed.push(aside);
+        pruned.push(path);
+    }
+    if !doomed.is_empty() {
+        sync_directory(&parent)?;
+    }
+    for dir in doomed {
+        if let Err(error) = fs::remove_dir_all(&dir) {
+            tracing::warn!(dir = %dir.display(), %error, "could not remove old WAL-index quarantine");
+        }
+    }
+    Ok(pruned)
+}
+
+#[cfg(test)]
+pub mod tests {
+    use super::*;
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
+    use crate::franken_sync::tests::run_recovery_test_in_subprocess;
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
+    use crate::franken_sync::{Connection, SqliteValue, compat};
+
+    const CRASH_STAGE_ENV: &str = "BR_TEST_507_CRASH_STAGE";
+
+    thread_local! {
+        static FAILURE_STAGE: std::cell::Cell<Option<&'static str>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    pub(super) fn fail_at_recovery_boundary(stage: &str) -> io::Result<()> {
+        if FAILURE_STAGE.get() == Some(stage) {
+            return Err(io::Error::other(format!("injected failure at {stage}")));
+        }
+        Ok(())
+    }
+
+    // Only compiled into the unit-test binary. exit() intentionally bypasses
+    // every Rust destructor: this tests restart after process loss, not an
+    // ordinary error return with a conveniently running cleanup path.
+    pub(super) fn crash_at_recovery_boundary(stage: &str) {
+        if std::env::var(CRASH_STAGE_ENV).as_deref() == Ok(stage) {
+            std::process::exit(86);
+        }
+    }
+
+    fn wal_header(page_size: u32, big_endian: bool) -> [u8; 32] {
+        let mut header = [0; 32];
+        let magic: u32 = if big_endian { 0x377f_0683 } else { 0x377f_0682 };
+        header[..4].copy_from_slice(&magic.to_be_bytes());
+        header[4..8].copy_from_slice(&3_007_000_u32.to_be_bytes());
+        header[8..12].copy_from_slice(&page_size.to_be_bytes());
+        header[16..24].copy_from_slice(&[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]);
+        let sum = checksum(&header[..24], [0, 0], big_endian);
+        header[24..28].copy_from_slice(&sum[0].to_be_bytes());
+        header[28..32].copy_from_slice(&sum[1].to_be_bytes());
+        header
+    }
+
+    fn poison() -> [u8; 96] {
+        let mut header = [0; 48];
+        header[..4].copy_from_slice(&3_007_000_u32.to_ne_bytes());
+        header[12] = 1;
+        let mut both = [0; 96];
+        both[..48].copy_from_slice(&header);
+        both[48..].copy_from_slice(&header);
+        both
+    }
+
+    fn fixture() -> (tempfile::TempDir, PathBuf, FileIdentity) {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("beads.db");
+        let mut main = vec![0; 4096];
+        main[..16].copy_from_slice(b"SQLite format 3\0");
+        main[16..18].copy_from_slice(&4096_u16.to_be_bytes());
+        fs::write(&db, main).unwrap();
+        fs::write(sidecar(&db, "-wal"), wal_header(4096, false)).unwrap();
+        fs::write(sidecar(&db, "-shm"), poison()).unwrap();
+        let id = identity(&File::open(&db).unwrap()).unwrap();
+        (temp, db, id)
+    }
+
+    fn payload(db: &Path) -> [Vec<u8>; 3] {
+        ["", "-wal", "-shm"].map(|suffix| fs::read(sidecar(db, suffix)).unwrap())
+    }
+
+    #[test]
+    fn recognizes_only_duplicate_initialized_zero_page_headers() {
+        for big_endian in [false, true] {
+            let wal = wal_header(4096, big_endian);
+            assert!(poisoned_headers(&wal, &poison()));
+            for offset in [12, 14, 16, 20, 32] {
+                let mut changed = poison();
+                changed[offset] ^= 1;
+                changed[offset + 48] ^= 1;
+                assert!(!poisoned_headers(&wal, &changed), "field {offset}");
+            }
+            let mut torn = poison();
+            torn[48] ^= 1;
+            assert!(!poisoned_headers(&wal, &torn));
+        }
+    }
+
+    /// Stock SQLite's unindexed empty index: #507's shape under a valid
+    /// native-order header checksum (sqlite3 `walIndexWriteHdr`), computed
+    /// for this host's byte order.
+    fn stock_empty_index() -> [u8; 96] {
+        let mut header: [u8; 48] = poison()[..48].try_into().unwrap();
+        header[13] = u8::from(cfg!(target_endian = "big"));
+        let sum = checksum(&header[..40], [0, 0], cfg!(target_endian = "big"));
+        header[40..44].copy_from_slice(&sum[0].to_ne_bytes());
+        header[44..48].copy_from_slice(&sum[1].to_ne_bytes());
+        let mut shm = [0; 96];
+        shm[..48].copy_from_slice(&header);
+        shm[48..].copy_from_slice(&header);
+        shm
+    }
+
+    #[test]
+    fn stock_empty_index_is_recognized_only_beside_a_header_only_wal() {
+        if cfg!(target_endian = "little") {
+            // Byte for byte what stock SQLite 3.51 wrote on a little-endian host.
+            assert_eq!(stock_empty_index(), stock_sqlite_header_only_index());
+        }
+        let (_temp, db, _) = fixture();
+        // #507's poison fixture carries no checksum: still poison, not admitted.
+        assert!(poisoned_index_present_for_engine(&db, true).unwrap());
+        assert!(!stock_empty_probe(&db, true).unwrap());
+
+        fs::write(sidecar(&db, "-shm"), stock_empty_index()).unwrap();
+        assert!(poisoned_index_present_for_engine(&db, true).unwrap());
+        assert!(stock_empty_probe(&db, true).unwrap());
+        // Where the engine keeps its index in memory, nothing is classified.
+        assert!(!stock_empty_probe(&db, false).unwrap());
+
+        for (offset, label) in [(0, "version"), (40, "checksum"), (48, "torn copy")] {
+            let mut changed = stock_empty_index();
+            changed[offset] ^= 1;
+            if offset != 48 {
+                changed[offset + 48] ^= 1;
+            }
+            fs::write(sidecar(&db, "-shm"), changed).unwrap();
+            assert!(!stock_empty_probe(&db, true).unwrap(), "{label}");
+        }
+
+        // Any WAL byte past the header (a frame, or part of one) makes the
+        // empty index stale; the engine then still requires recovery.
+        fs::write(sidecar(&db, "-shm"), stock_empty_index()).unwrap();
+        let mut wal = wal_header(4096, false).to_vec();
+        wal.push(0);
+        fs::write(sidecar(&db, "-wal"), &wal).unwrap();
+        assert!(poisoned_index_present_for_engine(&db, true).unwrap());
+        assert!(!stock_empty_probe(&db, true).unwrap());
+        fs::remove_file(sidecar(&db, "-wal")).unwrap();
+        assert!(!stock_empty_probe(&db, true).unwrap());
+    }
+
+    #[test]
+    fn prune_keeps_recent_failed_foreign_and_unproven_quarantines() {
+        const DAY: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("beads.db");
+        let database_path = fs::canonicalize(temp.path())
+            .unwrap()
+            .join("beads.db")
+            .display()
+            .to_string();
+        let now = std::time::SystemTime::now();
+        let index = [7_u8; 96];
+        let index_sha = hash_file(&mut {
+            let path = temp.path().join("index-for-hash");
+            fs::write(&path, index).unwrap();
+            File::open(&path).unwrap()
+        })
+        .unwrap();
+        // (name, database, announces marker, writes marker, index bytes, extra file, age)
+        let make = |name: &str,
+                    database: &str,
+                    announced: bool,
+                    complete: bool,
+                    shm: &[u8],
+                    extra: bool,
+                    age_days: u32| {
+            let dir = temp.path().join(format!("{QUARANTINE_PREFIX}{name}"));
+            fs::create_dir(&dir).unwrap();
+            let mut receipt = serde_json::json!({
+                "schema_version": "br.wal_index.quarantine.v1",
+                "database_path": database,
+                "shm_sha256": &index_sha,
+            });
+            if announced {
+                receipt["completion_marker"] = QUARANTINE_COMPLETE.into();
+            }
+            fs::write(dir.join(QUARANTINED_INDEX), shm).unwrap();
+            if complete {
+                fs::write(dir.join(QUARANTINE_COMPLETE), "{}").unwrap();
+            }
+            if extra {
+                fs::write(dir.join("stray"), "").unwrap();
+            }
+            let prepared = dir.join(QUARANTINE_PREPARED);
+            fs::write(&prepared, receipt.to_string()).unwrap();
+            File::options()
+                .write(true)
+                .open(&prepared)
+                .unwrap()
+                .set_modified(now - DAY * age_days)
+                .unwrap();
+        };
+        make("a", &database_path, true, true, &index, false, 1);
+        make("b", &database_path, true, true, &index, false, 8);
+        make("c", &database_path, true, true, &index, false, 9);
+        make("d", &database_path, true, false, &index, false, 10);
+        make("e", &database_path, false, false, &index, false, 11);
+        make("f", &database_path, false, false, &[8; 96], false, 12);
+        make("g", &database_path, false, false, &index, false, 13);
+        make("h", "/elsewhere/beads.db", true, true, &index, false, 20);
+        make("i", &database_path, false, false, &index, true, 14);
+        fs::create_dir(temp.path().join(format!("{QUARANTINE_PREFIX}j"))).unwrap();
+        let leftover = temp.path().join(format!("{QUARANTINE_PRUNING_PREFIX}k"));
+        fs::create_dir(&leftover).unwrap();
+        let failures = [format!(
+            "{{\"error\":\"WAL-index quarantine did not complete: x; evidence retained at {}\"}}",
+            temp.path().join(format!("{QUARANTINE_PREFIX}g")).display()
+        )];
+
+        let mut pruned = prune_quarantined_indexes(&db, 2, DAY * 7, now, &failures).unwrap();
+        pruned.sort();
+        let named = |name: &str| {
+            fs::canonicalize(temp.path())
+                .unwrap()
+                .join(format!("{QUARANTINE_PREFIX}{name}"))
+        };
+        // a and b are the newest two; c (marked) and e (proven legacy) go;
+        // d (never marked), f (index changed), g (named by a failure), i
+        // (unexpected contents), h (another database) and j (no receipt) stay.
+        assert_eq!(pruned, [named("c"), named("e")]);
+        for name in ["a", "b", "d", "f", "g", "h", "i", "j"] {
+            assert!(named(name).is_dir(), "{name} must be kept");
+        }
+        assert!(!named("c").exists() && !named("e").exists());
+        assert!(!leftover.exists(), "an interrupted prune is swept");
+        assert!(
+            prune_quarantined_indexes(&db, 2, DAY * 7, now, &failures)
+                .unwrap()
+                .is_empty()
+        );
+        // Young finished quarantines are kept no matter how many there are.
+        assert!(
+            prune_quarantined_indexes(&db, 0, DAY * 30, now, &[])
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn healthy_salts_and_64k_encoding_are_not_poison() {
+        for size in [512_u32, 4096, 65_536] {
+            let wal = wal_header(size, false);
+            let mut shm = poison();
+            let encoded = if size == 65_536 {
+                1
+            } else {
+                u16::try_from(size).unwrap()
+            };
+            for offset in [0, 48] {
+                shm[offset + 14..offset + 16].copy_from_slice(&encoded.to_ne_bytes());
+                // Salts must retain the WAL byte order, not native scalar order.
+                shm[offset + 32..offset + 40].copy_from_slice(&wal[16..24]);
+            }
+            assert!(!poisoned_headers(&wal, &shm));
+            shm[32] ^= 1;
+            shm[80] ^= 1;
+            assert!(
+                !poisoned_headers(&wal, &shm),
+                "salt mismatch alone is not authority"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_wal_headers_are_not_quarantine_evidence() {
+        let header = wal_header(4096, false);
+        for offset in [0, 4, 8, 16, 24, 31] {
+            let mut damaged = header;
+            damaged[offset] ^= 1;
+            assert!(!poisoned_headers(&damaged, &poison()));
+        }
+        for size in [0, 1, 256, 513, 131_072] {
+            assert!(wal_layout(&wal_header(size, false)).is_err());
+        }
+    }
+
+    /// The exact index header stock SQLite 3.51 writes after recovering a
+    /// header-only (32-byte, zero-frame) WAL: initialized, zero page size,
+    /// zero frames, zero salts, plus its own header checksum. It is the #507
+    /// byte pattern, produced by any stock SQLite reader of the family (GH #520).
+    fn stock_sqlite_header_only_index() -> [u8; 96] {
+        let mut shm = poison();
+        for offset in [0, 48] {
+            shm[offset + 40..offset + 48]
+                .copy_from_slice(&[0x38, 0x07, 0x18, 0x06, 0x35, 0x93, 0xdb, 0x09]);
+        }
+        shm
+    }
+
+    /// Lay out the GH #520 reporter's family at `db`: a main file, a 32-byte
+    /// header-only WAL, and the index stock SQLite leaves beside it.
+    pub fn write_stock_header_only_family(db: &Path) {
+        let mut main = vec![0; 4096];
+        main[..16].copy_from_slice(b"SQLite format 3\0");
+        main[16..18].copy_from_slice(&4096_u16.to_be_bytes());
+        fs::write(db, main).unwrap();
+        fs::write(sidecar(db, "-wal"), wal_header(4096, false)).unwrap();
+        fs::write(sidecar(db, "-shm"), stock_sqlite_header_only_index()).unwrap();
+    }
+
+    /// The engine's reaction to the index stock SQLite writes beside a
+    /// header-only WAL, on a real database. fsqlite 0.4.4 refused it
+    /// read-only with `BusyRecovery`; 0.4.6+ admits it for reads
+    /// (Dicklesworthstone/frankensqlite#431), so read-only commands no longer
+    /// copy the family. On 0.4.7 the first commit through it still fails
+    /// with `BusyRecovery`, which is why writable startup keeps rebuilding
+    /// it. When the engine starts accepting that commit, this test still
+    /// passes and the startup recovery for this shape becomes removable.
+    #[cfg(unix)]
+    #[test]
+    fn engine_reaction_to_stock_header_only_index() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("stock.db");
+        let path = db.to_string_lossy().into_owned();
+        let conn = crate::franken_sync::Connection::open(path.clone()).unwrap();
+        conn.execute("PRAGMA journal_mode=WAL").unwrap();
+        conn.execute("CREATE TABLE t(x)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+        conn.close().unwrap();
+        let install_stock_family = || {
+            fs::write(sidecar(&db, "-wal"), wal_header(4096, false)).unwrap();
+            // A full 32 KiB region as stock leaves it: the header copies,
+            // then reader mark 0 at zero and marks 1..=4 unused.
+            let mut shm = vec![0_u8; 32 * 1024];
+            shm[..96].copy_from_slice(&stock_sqlite_header_only_index());
+            shm[104..120].fill(0xFF);
+            fs::write(sidecar(&db, "-shm"), shm).unwrap();
+        };
+        let count = |conn: &crate::franken_sync::Connection| {
+            conn.query_row("SELECT count(*) FROM t")
+                .map(|row| row.get(0).and_then(SqliteValue::as_integer))
+        };
+
+        install_stock_family();
+        if cfg!(target_endian = "little") {
+            assert!(stock_empty_index_present(&db).unwrap());
+        }
+        let read_only = crate::franken_sync::compat::open_with_flags(
+            &path,
+            crate::franken_sync::compat::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        assert_eq!(count(&read_only).unwrap(), Some(1));
+        read_only.close().unwrap();
+
+        // A writable open reads through it too; its first commit either
+        // lands (a future engine) or is refused as recovery, never lost.
+        install_stock_family();
+        let conn = crate::franken_sync::Connection::open(path.clone()).unwrap();
+        assert_eq!(count(&conn).unwrap(), Some(1));
+        let expected = match conn.execute("INSERT INTO t VALUES (2)") {
+            Ok(_) => Some(2),
+            Err(FrankenError::BusyRecovery) => Some(1),
+            Err(error) => panic!("commit through the stock index failed otherwise: {error:?}"),
+        };
+        let _ = conn.close();
+        let read_only = crate::franken_sync::compat::open_with_flags(
+            &path,
+            crate::franken_sync::compat::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        assert_eq!(count(&read_only).unwrap(), expected);
+        read_only.close().unwrap();
+    }
+
+    #[test]
+    fn private_index_engine_never_reports_or_quarantines_the_on_disk_index() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("beads.db");
+        write_stock_header_only_family(&db);
+        let before = payload(&db);
+        // An engine that maps -shm (Unix) reads these bytes: #507 unchanged.
+        assert!(probe_for_engine(&db, true).unwrap());
+        // An engine that keeps its index in private memory (Windows) never
+        // reads them, so they are neither evidence nor quarantine authority.
+        assert!(!probe_for_engine(&db, false).unwrap());
+        assert!(!poisoned_index_present_for_engine(&db, false).unwrap());
+        assert_eq!(poisoned_index_present(&db).unwrap(), cfg!(unix));
+        assert_eq!(payload(&db), before);
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 3);
+    }
+
+    /// A settled index that describes `wal` exactly, as a maintaining engine
+    /// leaves it: initialized, matching page size, byte order and salts.
+    fn index_describing(wal: &[u8; 32], max_frame: u32) -> [u8; 96] {
+        let (page_size, big_endian) = wal_layout(wal).unwrap();
+        let encoded = if page_size == 65_536 {
+            1
+        } else {
+            u16::try_from(page_size).unwrap()
+        };
+        let mut header = [0; 48];
+        header[..4].copy_from_slice(&3_007_000_u32.to_ne_bytes());
+        header[8..12].copy_from_slice(&0x4a_u32.to_ne_bytes());
+        header[12] = 1;
+        header[13] = u8::from(big_endian);
+        header[14..16].copy_from_slice(&encoded.to_ne_bytes());
+        header[16..20].copy_from_slice(&max_frame.to_ne_bytes());
+        header[32..40].copy_from_slice(&wal[16..24]);
+        header[40..48].copy_from_slice(&[0xA5; 8]);
+        let mut both = [0; 96];
+        both[..48].copy_from_slice(&header);
+        both[48..].copy_from_slice(&header);
+        both
+    }
+
+    #[test]
+    fn stale_index_shapes_are_recognized_and_healthy_ones_are_not() {
+        for big_endian in [false, true] {
+            for size in [4096_u32, 65_536] {
+                let wal = wal_header(size, big_endian);
+                let healthy = index_describing(&wal, 0);
+                assert!(!stale_headers(&wal, &healthy, 0), "healthy {size}");
+                assert!(!stale_headers(&wal, &index_describing(&wal, 3), 3));
+                assert!(!stale_headers(&wal, &index_describing(&wal, 2), 3));
+
+                // br 0.6.0: the engine never wrote the header at all.
+                assert!(stale_headers(&wal, &[0; 96], 0), "never initialized");
+
+                // Another WAL generation: salts from a WAL since restarted.
+                let mut other_generation = healthy;
+                other_generation[32] ^= 1;
+                other_generation[80] ^= 1;
+                assert!(stale_headers(&wal, &other_generation, 0));
+
+                // More frames indexed than the WAL holds.
+                assert!(stale_headers(&wal, &index_describing(&wal, 4), 3));
+
+                // Page size or checksum byte order disagreeing with the WAL.
+                let mut wrong_size = healthy;
+                wrong_size[14..16].copy_from_slice(&512_u16.to_ne_bytes());
+                wrong_size[62..64].copy_from_slice(&512_u16.to_ne_bytes());
+                assert!(stale_headers(&wal, &wrong_size, 0));
+                let mut wrong_order = healthy;
+                wrong_order[13] ^= 1;
+                wrong_order[61] ^= 1;
+                assert!(stale_headers(&wal, &wrong_order, 0));
+
+                // #507's poison is also unusable read-only (zero page size).
+                assert!(stale_headers(&wal, &poison(), 0));
+            }
+        }
+    }
+
+    #[test]
+    fn torn_headers_and_invalid_wals_are_left_to_the_engine() {
+        let wal = wal_header(4096, false);
+        // A header mid-update (copies differ) is not a settled verdict.
+        let mut torn = [0; 96];
+        torn[48..].copy_from_slice(&index_describing(&wal, 0)[48..]);
+        assert!(!stale_headers(&wal, &torn, 0));
+        let mut torn_salt = index_describing(&wal, 0);
+        torn_salt[32] ^= 1;
+        assert!(!stale_headers(&wal, &torn_salt, 0));
+        // An unknown isInit value is not ours to classify.
+        let mut odd = index_describing(&wal, 0);
+        odd[12] = 2;
+        odd[60] = 2;
+        assert!(!stale_headers(&wal, &odd, 0));
+        // Without a valid WAL header there is nothing to compare against.
+        for offset in [0, 8, 24] {
+            let mut damaged = wal;
+            damaged[offset] ^= 1;
+            assert!(!stale_headers(&damaged, &[0; 96], 0));
+        }
+    }
+
+    #[test]
+    fn stale_probe_reads_the_real_family_and_never_mutates_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("beads.db");
+        let mut main = vec![0; 4096];
+        main[..16].copy_from_slice(b"SQLite format 3\0");
+        main[16..18].copy_from_slice(&4096_u16.to_be_bytes());
+        fs::write(&db, main).unwrap();
+        let wal = wal_header(4096, false);
+        fs::write(sidecar(&db, "-wal"), wal).unwrap();
+
+        // No index at all is the missing-index case, not a stale one.
+        assert!(!stale_probe_for_engine(&db, true).unwrap());
+
+        // br 0.6.0 leaves a 32 KiB -shm whose header was never written.
+        let mut legacy = vec![0_u8; 32 * 1024];
+        legacy[108..120].fill(0xFF);
+        fs::write(sidecar(&db, "-shm"), &legacy).unwrap();
+        let before = payload(&db);
+        assert!(stale_probe_for_engine(&db, true).unwrap());
+        assert_eq!(stale_index_present(&db).unwrap(), cfg!(unix));
+        // An engine with a private index never reads these bytes (GH #520).
+        assert!(!stale_probe_for_engine(&db, false).unwrap());
+        assert!(!stale_index_present_for_engine(&db, false).unwrap());
+        assert_eq!(payload(&db), before);
+
+        // The frame count comes from the WAL length: one full frame admits
+        // mxFrame = 1, a trailing partial frame does not count.
+        let mut healthy = index_describing(&wal, 1);
+        fs::write(sidecar(&db, "-shm"), healthy).unwrap();
+        let mut one_frame = wal.to_vec();
+        one_frame.extend(vec![0; 4096 + 24]);
+        fs::write(sidecar(&db, "-wal"), &one_frame).unwrap();
+        assert!(!stale_probe_for_engine(&db, true).unwrap());
+        one_frame.truncate(32 + 4096);
+        fs::write(sidecar(&db, "-wal"), &one_frame).unwrap();
+        assert!(stale_probe_for_engine(&db, true).unwrap());
+        healthy = index_describing(&wal, 0);
+        fs::write(sidecar(&db, "-shm"), healthy).unwrap();
+        assert!(!stale_probe_for_engine(&db, true).unwrap());
+
+        // A short WAL or index is never evidence.
+        fs::write(sidecar(&db, "-wal"), &wal[..31]).unwrap();
+        assert!(!stale_probe_for_engine(&db, true).unwrap());
+        fs::write(sidecar(&db, "-wal"), wal).unwrap();
+        fs::write(sidecar(&db, "-shm"), [0; 95]).unwrap();
+        assert!(!stale_probe_for_engine(&db, true).unwrap());
+    }
+
+    /// The engine's reaction to the index br 0.6.0 leaves (GH #521), on a
+    /// real database: read-only admission cannot use it, a writable open
+    /// rebuilds it in place, and afterwards the probe reports it healthy.
+    #[cfg(unix)]
+    #[test]
+    fn engine_rebuilds_the_legacy_index_on_a_writable_open() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("legacy.db");
+        let path = db.to_string_lossy().into_owned();
+        let conn = crate::franken_sync::Connection::open(path.clone()).unwrap();
+        conn.execute("PRAGMA journal_mode=WAL").unwrap();
+        conn.execute("CREATE TABLE t(x)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+        conn.close().unwrap();
+        // The settled family br 0.6.0 leaves: a header-only WAL beside an
+        // index whose header its engine never wrote.
+        fs::write(sidecar(&db, "-wal"), wal_header(4096, false)).unwrap();
+        let mut legacy = vec![0_u8; 32 * 1024];
+        legacy[108..120].fill(0xFF);
+        fs::write(sidecar(&db, "-shm"), &legacy).unwrap();
+        assert!(stale_probe_for_engine(&db, true).unwrap());
+
+        let count = |conn: &crate::franken_sync::Connection| {
+            conn.query_row("SELECT count(*) FROM t")
+                .map(|row| row.get(0).and_then(SqliteValue::as_integer))
+        };
+        // Whatever read-only admission does today, it must not succeed with
+        // wrong data; BusyRecovery is the fsqlite 0.4.4 answer.
+        match crate::franken_sync::compat::open_with_flags(
+            &path,
+            crate::franken_sync::compat::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .and_then(|conn| count(&conn))
+        {
+            Ok(rows) => assert_eq!(rows, Some(1)),
+            Err(error) => assert!(
+                matches!(error, FrankenError::BusyRecovery),
+                "read-only admission failed other than BusyRecovery: {error:?}"
+            ),
+        }
+
+        let conn = crate::franken_sync::Connection::open(path).unwrap();
+        assert_eq!(count(&conn).unwrap(), Some(1));
+        conn.close().unwrap();
+        assert!(
+            !stale_probe_for_engine(&db, true).unwrap(),
+            "a writable open must leave an index the probe accepts"
+        );
+    }
+
+    #[test]
+    fn probe_is_bounded_and_observational() {
+        let (_temp, db, _) = fixture();
+        let before = payload(&db);
+        assert!(probe(&db).unwrap());
+        assert_eq!(payload(&db), before);
+        for bytes in [Vec::new(), vec![0; 31]] {
+            fs::write(sidecar(&db, "-wal"), bytes).unwrap();
+            assert!(!probe(&db).unwrap());
+        }
+        assert!(!probe(&db.with_file_name("absent.db")).unwrap());
+        fs::write(sidecar(&db, "-wal"), wal_header(4096, false)).unwrap();
+        fs::write(sidecar(&db, "-shm"), [0; 95]).unwrap();
+        assert!(!probe(&db).unwrap());
+    }
+
+    fn one_frame_wal(commit: bool, big_endian: bool) -> Vec<u8> {
+        let header = wal_header(4096, big_endian);
+        let mut frame = vec![0; 24 + 4096];
+        frame[..4].copy_from_slice(&1_u32.to_be_bytes());
+        frame[4..8].copy_from_slice(&u32::from(commit).to_be_bytes());
+        frame[8..16].copy_from_slice(&header[16..24]);
+        let state = checksum(
+            &frame[..8],
+            [be32(&header[24..28]), be32(&header[28..32])],
+            big_endian,
+        );
+        let state = checksum(&frame[24..], state, big_endian);
+        frame[16..20].copy_from_slice(&state[0].to_be_bytes());
+        frame[20..24].copy_from_slice(&state[1].to_be_bytes());
+        [header.to_vec(), frame].concat()
+    }
+
+    #[test]
+    fn strict_wal_validation_rejects_corrupt_partial_and_uncommitted_tails() {
+        let (_temp, db, _) = fixture();
+        let wal_path = sidecar(&db, "-wal");
+        for big_endian in [false, true] {
+            let valid = one_frame_wal(true, big_endian);
+            fs::write(&wal_path, &valid).unwrap();
+            assert!(
+                validate_wal(
+                    &mut File::open(&db).unwrap(),
+                    &mut File::open(&wal_path).unwrap()
+                )
+                .is_ok()
+            );
+            let mut corrupt = valid.clone();
+            corrupt[56] ^= 1;
+            let mut wrong_salt = valid.clone();
+            wrong_salt[40] ^= 1;
+            let partial = valid[..valid.len() - 1].to_vec();
+            for invalid in [
+                corrupt,
+                wrong_salt,
+                partial,
+                one_frame_wal(false, big_endian),
+            ] {
+                fs::write(&wal_path, &invalid).unwrap();
+                assert!(
+                    validate_wal(
+                        &mut File::open(&db).unwrap(),
+                        &mut File::open(&wal_path).unwrap()
+                    )
+                    .is_err()
+                );
+            }
+        }
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
+    #[test]
+    fn quarantine_retains_cache_and_preserves_every_payload_byte() {
+        // The immediate second quarantine call must see the first call's
+        // namespace and OFD locks released. A child that another test thread
+        // spawns in between inherits those descriptors until its exec closes
+        // them, so run isolated from the parallel parent (BusyRecovery flake).
+        if run_recovery_test_in_subprocess(
+            "franken_sync::wal_index::tests::quarantine_retains_cache_and_preserves_every_payload_byte",
+        ) {
+            return;
+        }
+        let (_temp, db, id) = fixture();
+        let before = payload(&db);
+        assert!(quarantine_poisoned_index(db.to_str().unwrap(), id).unwrap());
+        assert_eq!(fs::read(&db).unwrap(), before[0]);
+        assert_eq!(fs::read(sidecar(&db, "-wal")).unwrap(), before[1]);
+        assert!(!sidecar(&db, "-shm").exists());
+        let retained = fs::read_dir(db.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".br-wal-index-")
+            })
+            .unwrap();
+        assert_eq!(fs::read(retained.join("poisoned-shm")).unwrap(), before[2]);
+        let receipt: serde_json::Value =
+            serde_json::from_slice(&fs::read(retained.join("prepared.json")).unwrap()).unwrap();
+        assert_eq!(receipt["schema_version"], "br.wal_index.quarantine.v1");
+        assert_eq!(receipt["completion_marker"], QUARANTINE_COMPLETE);
+        assert!(retained.join(QUARANTINE_COMPLETE).is_file());
+        // Crash after quarantine is restartable: no second quarantine is needed.
+        assert!(!quarantine_poisoned_index(db.to_str().unwrap(), id).unwrap());
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
+    #[test]
+    fn quarantine_failure_cleans_only_preparations_without_forensic_state() {
+        // The immediate second quarantine call must see the first call's
+        // namespace and OFD locks released. A child that another test thread
+        // spawns in between inherits those descriptors until its exec closes
+        // them, so run isolated from the parallel parent (BusyRecovery flake).
+        if run_recovery_test_in_subprocess(
+            "franken_sync::wal_index::tests::quarantine_failure_cleans_only_preparations_without_forensic_state",
+        ) {
+            return;
+        }
+        for stage in [
+            "allocated",
+            "prepared",
+            "rename-result",
+            "renamed",
+            "durable",
+        ] {
+            let (temp, db, id) = fixture();
+            let before = payload(&db);
+            FAILURE_STAGE.set(Some(stage));
+            let result = quarantine_poisoned_index(db.to_str().unwrap(), id);
+            FAILURE_STAGE.set(None);
+            let error = result.expect_err("injected quarantine failure").to_string();
+            assert!(
+                error.contains(&format!("injected failure at {stage}")),
+                "{error}"
+            );
+            assert_eq!(fs::read(&db).unwrap(), before[0], "main at {stage}");
+            assert_eq!(
+                fs::read(sidecar(&db, "-wal")).unwrap(),
+                before[1],
+                "WAL at {stage}"
+            );
+            let preparations: Vec<_> = fs::read_dir(temp.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| {
+                    path.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with(".br-wal-index-")
+                })
+                .collect();
+            if matches!(stage, "allocated" | "prepared") {
+                assert_eq!(fs::read(sidecar(&db, "-shm")).unwrap(), before[2]);
+                assert!(preparations.is_empty(), "{stage}: {preparations:?}");
+                assert!(error.contains("temporary preparation removed"), "{error}");
+                assert!(!error.contains("evidence retained"), "{error}");
+                // A failed preparation leaves the original family available
+                // for a subsequent, fully validated recovery attempt.
+                assert!(quarantine_poisoned_index(db.to_str().unwrap(), id).unwrap());
+            } else {
+                assert!(!sidecar(&db, "-shm").exists(), "{stage}");
+                assert_eq!(preparations.len(), 1, "{stage}: {preparations:?}");
+                assert_eq!(
+                    fs::read(preparations[0].join("poisoned-shm")).unwrap(),
+                    before[2],
+                    "forensic bytes at {stage}"
+                );
+                assert!(preparations[0].join("prepared.json").is_file());
+                assert!(error.contains("evidence retained"), "{error}");
+                assert!(!error.contains("temporary preparation removed"), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn replacement_identity_and_live_engine_namespace_refuse_without_payload_changes() {
+        let (_temp, db, id) = fixture();
+        let before = payload(&db);
+        let peer =
+            PendingNamespaceOpen::begin(&db, NamespaceOpenIntent::ReservedExclusive).unwrap();
+        assert!(quarantine_poisoned_index(db.to_str().unwrap(), id).is_err());
+        assert_eq!(payload(&db), before);
+        drop(peer);
+        let other = db.with_file_name("other.db");
+        fs::write(&other, &before[0]).unwrap();
+        let wrong_id = identity(&File::open(other).unwrap()).unwrap();
+        assert!(quarantine_poisoned_index(db.to_str().unwrap(), wrong_id).is_err());
+        assert_eq!(payload(&db), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_and_hardlinked_index_is_never_quarantined() {
+        use std::os::unix::fs::symlink;
+        let (_temp, db, id) = fixture();
+        let shm = sidecar(&db, "-shm");
+        let retained = db.with_file_name("original-index");
+        fs::rename(&shm, &retained).unwrap();
+        symlink(&retained, &shm).unwrap();
+        assert!(quarantine_poisoned_index(db.to_str().unwrap(), id).is_err());
+        assert_eq!(fs::read(&retained).unwrap(), poison());
+        // Preserve the symlink as evidence rather than deleting it in the test.
+        fs::rename(&shm, db.with_file_name("retained-symlink")).unwrap();
+        fs::hard_link(&retained, &shm).unwrap();
+        assert!(quarantine_poisoned_index(db.to_str().unwrap(), id).is_err());
+        assert_eq!(fs::read(&retained).unwrap(), poison());
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
+    #[test]
+    fn invalid_wal_tail_refuses_before_quarantining_index() {
+        let (_temp, db, id) = fixture();
+        let mut wal = one_frame_wal(true, false);
+        wal[56] ^= 1;
+        fs::write(sidecar(&db, "-wal"), wal).unwrap();
+        let before = payload(&db);
+        assert!(quarantine_poisoned_index(db.to_str().unwrap(), id).is_err());
+        assert_eq!(payload(&db), before);
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
+    fn tracker_with_uncheckpointed_rows() -> (tempfile::TempDir, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("tracker.db");
+        let mut connection = Connection::open(db.to_string_lossy().into_owned()).unwrap();
+        connection.execute("PRAGMA journal_mode = WAL").unwrap();
+        connection.execute("PRAGMA wal_autocheckpoint = 0").unwrap();
+        connection
+            .execute("CREATE TABLE issues (id TEXT PRIMARY KEY)")
+            .unwrap();
+        connection
+            .execute("CREATE TABLE dependencies (source TEXT, target TEXT)")
+            .unwrap();
+        connection
+            .execute("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT)")
+            .unwrap();
+        connection.execute("PRAGMA user_version = 19").unwrap();
+        connection
+            .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
+        connection
+            .execute("INSERT INTO issues VALUES ('db-only-a'), ('db-only-b'), ('db-only-c')")
+            .unwrap();
+        connection.execute("INSERT INTO dependencies VALUES ('db-only-a', 'db-only-b'), ('db-only-b', 'db-only-c')").unwrap();
+        connection
+            .execute("INSERT INTO metadata VALUES ('sync_merge_pending', 'must-remain-blocking')")
+            .unwrap();
+        connection.close_without_checkpoint_in_place().unwrap();
+        drop(connection);
+        assert!(fs::metadata(sidecar(&db, "-wal")).unwrap().len() > 32);
+        (temp, db)
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
+    fn poison_tracker(db: &Path) {
+        let mut shm = open_regular(&sidecar(db, "-shm"), true).unwrap();
+        shm.write_all(&poison()).unwrap();
+        shm.sync_all().unwrap();
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
+    fn assert_tracker_contents(connection: &Connection) {
+        assert_eq!(connection.query("SELECT id FROM issues").unwrap().len(), 3);
+        assert_eq!(
+            connection
+                .query("SELECT source FROM dependencies")
+                .unwrap()
+                .len(),
+            2
+        );
+        let row = connection
+            .query_row("SELECT value FROM metadata WHERE key = 'sync_merge_pending'")
+            .unwrap();
+        assert_eq!(
+            row.get(0).and_then(SqliteValue::as_text),
+            Some("must-remain-blocking")
+        );
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
+    fn recover_and_close_without_payload_changes(db: &Path) {
+        let main_before = fs::read(db).unwrap();
+        let wal_before = fs::read(sidecar(db, "-wal")).unwrap();
+        let retained = File::open(db).unwrap();
+        let recovered = Connection::open_existing_with_expected_identity(
+            db.to_string_lossy().into_owned(),
+            identity(&retained).unwrap(),
+        )
+        .unwrap();
+        assert_tracker_contents(&recovered);
+        recovered.close().unwrap();
+        assert_eq!(fs::read(db).unwrap(), main_before);
+        assert_eq!(fs::read(sidecar(db, "-wal")).unwrap(), wal_before);
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
+    #[test]
+    fn identity_bound_recovery_preserves_unexported_rows_and_pending_metadata() {
+        if run_recovery_test_in_subprocess(
+            "franken_sync::wal_index::tests::identity_bound_recovery_preserves_unexported_rows_and_pending_metadata",
+        ) {
+            return;
+        }
+        let (_temp, db) = tracker_with_uncheckpointed_rows();
+        poison_tracker(&db);
+        let before = payload(&db);
+        // Read-only admission must never quarantine or modify the family.
+        match compat::open_with_flags(
+            db.to_str().unwrap(),
+            compat::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        ) {
+            Err(FrankenError::BusyRecovery) => {}
+            Ok(mut readonly) => {
+                assert!(matches!(
+                    readonly.query("SELECT id FROM issues"),
+                    Err(FrankenError::BusyRecovery)
+                ));
+                readonly.close_without_checkpoint_in_place().unwrap();
+            }
+            Err(error) => panic!("unexpected read-only error: {error}"),
+        }
+        assert_eq!(payload(&db), before);
+        let retained = File::open(&db).unwrap();
+        let recovered = Connection::open_existing_with_expected_identity(
+            db.to_string_lossy().into_owned(),
+            identity(&retained).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(recovered.query("SELECT id FROM issues").unwrap().len(), 3);
+        assert_eq!(
+            recovered
+                .query("SELECT source FROM dependencies")
+                .unwrap()
+                .len(),
+            2
+        );
+        let row = recovered
+            .query_row("SELECT value FROM metadata WHERE key = 'sync_merge_pending'")
+            .unwrap();
+        assert_eq!(
+            row.get(0).and_then(SqliteValue::as_text),
+            Some("must-remain-blocking")
+        );
+        assert_eq!(fs::read(&db).unwrap(), before[0]);
+        assert_eq!(fs::read(sidecar(&db, "-wal")).unwrap(), before[1]);
+        // Doctor calls close(), not the special no-checkpoint method. A
+        // reconstructed-cache handle must preserve WAL bytes on that path too.
+        recovered.close().unwrap();
+        assert_eq!(fs::read(&db).unwrap(), before[0]);
+        assert_eq!(fs::read(sidecar(&db, "-wal")).unwrap(), before[1]);
+        let mut writer = Connection::open(db.to_string_lossy().into_owned()).unwrap();
+        writer
+            .execute("INSERT INTO issues VALUES ('writes-work-again')")
+            .unwrap();
+        writer.close_without_checkpoint_in_place().unwrap();
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
+    #[test]
+    fn missing_and_healthy_index_recovery_preserve_wal_on_every_close() {
+        if run_recovery_test_in_subprocess(
+            "franken_sync::wal_index::tests::missing_and_healthy_index_recovery_preserve_wal_on_every_close",
+        ) {
+            return;
+        }
+        for missing in [false, true] {
+            let (_temp, db) = tracker_with_uncheckpointed_rows();
+            if missing {
+                fs::rename(sidecar(&db, "-shm"), db.with_file_name("retained-shm")).unwrap();
+            }
+            // This invocation did not quarantine anything. A second recovery
+            // also must not checkpoint the WAL merely because the first one
+            // successfully rebuilt the index.
+            recover_and_close_without_payload_changes(&db);
+            recover_and_close_without_payload_changes(&db);
+        }
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
+    #[test]
+    #[ignore = "subprocess worker for recovery_survives_abrupt_process_exit"]
+    fn recovery_crash_worker() {
+        let db = PathBuf::from(std::env::var_os("BR_TEST_507_CRASH_DATABASE").unwrap());
+        let retained = File::open(&db).unwrap();
+        let recovered = Connection::open_existing_with_expected_identity(
+            db.to_string_lossy().into_owned(),
+            identity(&retained).unwrap(),
+        )
+        .unwrap();
+        assert_tracker_contents(&recovered);
+        crash_at_recovery_boundary("admitted");
+        recovered.close().unwrap();
+        panic!("requested crash boundary was not reached");
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
+    #[test]
+    fn recovery_survives_abrupt_process_exit() {
+        const WORKER: &str = "franken_sync::wal_index::tests::recovery_crash_worker";
+        if run_recovery_test_in_subprocess(
+            "franken_sync::wal_index::tests::recovery_survives_abrupt_process_exit",
+        ) {
+            return;
+        }
+        for stage in ["prepared", "renamed", "durable", "admitted"] {
+            let (_temp, db) = tracker_with_uncheckpointed_rows();
+            poison_tracker(&db);
+            let before = payload(&db);
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    WORKER,
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env("BR_TEST_507_CRASH_DATABASE", &db)
+                .env(CRASH_STAGE_ENV, stage)
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(86),
+                "worker did not reach {stage}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            assert_eq!(fs::read(&db).unwrap(), before[0], "main at {stage}");
+            assert_eq!(
+                fs::read(sidecar(&db, "-wal")).unwrap(),
+                before[1],
+                "WAL at {stage}"
+            );
+            match stage {
+                "prepared" => assert_eq!(fs::read(sidecar(&db, "-shm")).unwrap(), before[2]),
+                "renamed" | "durable" => assert!(!sidecar(&db, "-shm").exists()),
+                "admitted" => assert!(!probe(&db).unwrap()),
+                _ => unreachable!(),
+            }
+            let retained = fs::read_dir(db.parent().unwrap())
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .find(|path| {
+                    path.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with(".br-wal-index-")
+                })
+                .unwrap();
+            assert!(retained.join("prepared.json").is_file());
+            if stage != "prepared" {
+                assert_eq!(fs::read(retained.join("poisoned-shm")).unwrap(), before[2]);
+            }
+            // Both the restart and a repeated recovery must preserve WAL-only
+            // rows. The old per-invocation quarantine flag failed this check
+            // after "renamed", "durable", and "admitted".
+            recover_and_close_without_payload_changes(&db);
+            recover_and_close_without_payload_changes(&db);
+            assert_eq!(fs::read(&db).unwrap(), before[0]);
+            assert_eq!(fs::read(sidecar(&db, "-wal")).unwrap(), before[1]);
+        }
+    }
+}

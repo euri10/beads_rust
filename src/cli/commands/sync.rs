@@ -1396,9 +1396,13 @@ fn render_deferred_sync_output(output: DeferredSyncOutput, ctx: &OutputContext) 
                     "conflicts": report.conflicts.len(),
                     "resolution": resolution,
                     "notes": report.notes,
+                    "id_collisions": report.id_collisions,
                     "warnings": capacity_warnings,
                 }));
             } else if should_render_human_sync_output(ctx, use_json) {
+                for collision in &report.id_collisions {
+                    ctx.warning(&id_collision_warning(collision));
+                }
                 if ctx.is_rich() {
                     render_merge_result_rich(&report, ctx);
                 } else {
@@ -3873,37 +3877,13 @@ fn execute_import(
         && (args.force || args.rebuild || import_rewrote_storage)
         && !skip_heavy_import_maintenance
     {
-        // Drain the WAL before VACUUM/REINDEX so the snapshot they operate
-        // on matches what's actually on disk. Without this, fsqlite's
-        // post-import MVCC state lags behind and VACUUM fails silently with
-        // "database is busy (snapshot conflict on pages)", leaving the
-        // free-space / partial-index corruption that triggered issue #248
-        // and frankentorch-dbp.
-        if let Err(e) = storage.checkpoint_full() {
-            warn!(
-                error = %e,
-                db_path = %db_path.display(),
-                "Full WAL checkpoint after JSONL import failed (non-fatal)"
-            );
-        }
-        if let Err(e) = storage.execute_raw("VACUUM") {
-            warn!(error = %e, "VACUUM after JSONL import failed (non-fatal); DB may still contain free-space corruption");
-        }
-        if let Err(e) = storage.execute_raw("REINDEX") {
-            warn!(error = %e, "REINDEX after JSONL import failed (non-fatal); partial-index entries may be inconsistent");
-        }
-        // Final compaction via `VACUUM INTO` + atomic rename. fsqlite's
-        // in-place VACUUM does not truncate the trailing pages that its
-        // REINDEX leaves orphaned, so upstream sqlite3's `PRAGMA
-        // integrity_check` reports `Page N: never used` on the rebuilt
-        // file (issue #248). `VACUUM INTO` sidesteps the bug because it
-        // writes a brand-new compacted file from the reachable page set,
-        // page count and layout matching what `sqlite3 "VACUUM INTO"`
-        // would produce. The helper runs its own pre-VACUUM-INTO WAL
-        // checkpoint to drain the frames the VACUUM/REINDEX above just
-        // wrote. Once it closes the old handle, reopen failures must abort
-        // this import rather than letting subsequent metadata updates run
-        // against a throwaway placeholder.
+        // Final maintenance is isolated from the live tracker. The compaction
+        // helper checkpoints once, copies the main database into a private
+        // recovery-directory source, and runs VACUUM/REINDEX/VACUUM INTO
+        // there. Only the attested candidate crosses the existing atomic
+        // installation boundary, so an interrupted source VACUUM cannot
+        // poison the live WAL-index (#507). Reopen failures still abort this
+        // import rather than letting metadata updates use a placeholder.
         let placeholder = crate::storage::SqliteStorage::open_memory()?;
         let original_storage = std::mem::replace(storage, placeholder);
         match config::compact_database_via_vacuum_into_in_place(
@@ -4849,12 +4829,19 @@ fn build_source_repo_path_migration_plan(
     let mut tombstones_preserved = 0usize;
     let mut ephemeral_source_records_skipped = 0usize;
 
+    // GitHub #528: the JSONL no longer carries source_repo_path. A row that
+    // still does is legacy and forces a rewrite that strips the field; an
+    // absent path is the current format, not a value to normalize, though the
+    // row still adopts the target path in the database.
+    let mut source_carries_legacy_paths = false;
     for mut incoming in source_issues {
         if incoming.ephemeral || incoming.id.contains("-wisp-") {
             ephemeral_source_records_skipped += 1;
             continue;
         }
-        if normalize_issue_source_repo_path(&mut incoming, &target_path) {
+        let carried_path = incoming.source_repo_path.is_some();
+        source_carries_legacy_paths |= carried_path;
+        if normalize_issue_source_repo_path(&mut incoming, &target_path) && carried_path {
             normalized_issue_ids.insert(incoming.id.clone());
         }
         normalized_source.insert(incoming.id.clone(), incoming.clone());
@@ -4906,18 +4893,21 @@ fn build_source_repo_path_migration_plan(
         }
     }
 
-    let jsonl_rewrite_required = normalized_source.len() != final_by_id.len()
+    let jsonl_rewrite_required = source_carries_legacy_paths
+        || normalized_source.len() != final_by_id.len()
         || final_by_id.iter().any(|(issue_id, issue)| {
             normalized_source
                 .get(issue_id)
                 .is_none_or(|source_issue| !source_issue.sync_equals(issue))
         });
+    // sync_equals ignores the machine-local path, so compare it explicitly:
+    // normalizing the database path is this migration's purpose.
     let mut changed_kept = final_by_id
         .values()
         .filter(|issue| {
-            original_database
-                .get(&issue.id)
-                .is_none_or(|before| !before.sync_equals(issue))
+            original_database.get(&issue.id).is_none_or(|before| {
+                !before.sync_equals(issue) || before.source_repo_path != issue.source_repo_path
+            })
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -5385,6 +5375,24 @@ fn execute_merge(
                     .to_string(),
         });
     }
+    // A JSONL with no issues at all (a truncated file, an empty checkout)
+    // reads as "the other side deleted everything" and would delete every
+    // issue the database still shares with the last sync, under every
+    // strategy (an unchanged issue deleted on one side is not a conflict).
+    // Deletions normally leave tombstones, so refuse unless the deletion is
+    // explicitly accepted, as the export guard does for an empty database
+    // over a non-empty JSONL.
+    if source.is_some()
+        && right.is_empty()
+        && !args.force_jsonl
+        && base.keys().any(|id| left.contains_key(id))
+    {
+        return Err(BeadsError::SyncConflict {
+            message:
+                "issues.jsonl contains no issues, so merging it would delete every issue the database shares with the last sync. Restore issues.jsonl (for example from git) or rewrite it from the database with `br sync --flush-only --force`; pass --force-jsonl to accept deleting them"
+                    .to_string(),
+        });
+    }
     if base_source.is_none() && left != right && !args.force_db && !args.force_jsonl {
         return Err(BeadsError::SyncConflict {
             message:
@@ -5580,6 +5588,28 @@ fn render_merge_conflicts_rich(
         .title(Text::new("Merge Conflicts"))
         .box_style(theme.box_style);
     console.print_renderable(&panel);
+}
+
+/// One loud line per id that two clones minted for different issues (#512).
+fn id_collision_warning(collision: &crate::sync::IdCollision) -> String {
+    let side = |side: crate::sync::MergeSide| match side {
+        crate::sync::MergeSide::Local => "local database",
+        crate::sync::MergeSide::External => "JSONL",
+    };
+    let id = &collision.id;
+    let kept = side(collision.kept_side);
+    let moved = side(collision.relocated_side);
+    let title = sanitize_terminal_inline(&collision.relocated_title);
+    let new_id = &collision.relocated_id;
+    if collision.already_relocated {
+        format!(
+            "ID collision: {id} named two different issues. Kept the {kept} issue as {id}; the {moved} issue \"{title}\" was already renumbered to {new_id} by another clone and was merged there."
+        )
+    } else {
+        format!(
+            "ID collision: {id} named two different issues. Kept the {kept} issue as {id} and renumbered the {moved} issue \"{title}\" to {new_id}; update any external references to {id} that meant it."
+        )
+    }
 }
 
 /// Render merge result with rich formatting.

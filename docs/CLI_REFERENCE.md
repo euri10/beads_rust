@@ -295,6 +295,7 @@ br list [OPTIONS]
 | `--id <ID>` | Filter by specific IDs (can repeat) |
 | `-l, --label <LABEL>` | Filter by label (AND logic, can repeat) |
 | `--label-any <LABEL>` | Filter by label (OR logic, can repeat) |
+| `--exclude-label <LABEL>` | Hide issues carrying this label (can repeat; any match hides). Applied after `--label`/`--label-any` |
 | `-p, --priority <PRIORITY>` | Filter by priority (can repeat) |
 | `--priority-min <N>` | Filter by minimum priority |
 | `--priority-max <N>` | Filter by maximum priority |
@@ -317,7 +318,44 @@ br list [OPTIONS]
 | `--wrap` | Wrap long lines instead of truncating in text output |
 | `--format <FMT>` | Output format: text, json, csv, toon |
 | `--stats` | Show token savings stats when using TOON output |
-| `--fields <FIELDS>` | CSV fields (comma-separated) |
+| `--fields <FIELDS>` | Comma-separated column selection. Picks CSV columns for `--format csv`, and selects which keys appear in each row for `--json`/`--format toon` (see below) |
+
+**`--fields` with JSON/TOON (agent payload control):**
+
+`--fields` selects **columns**, never **rows**. The matching issues, the page
+metadata (`total`, `limit`, `offset`, `has_more`) and the paging boundaries are
+identical with and without it; only the keys present in each row change.
+Unselected long text is never serialized — the row is built from the selection
+rather than serialized in full and then trimmed.
+
+Selectable keys: `id`, `title`, `status`, `priority`, `issue_type`, `assignee`,
+`owner`, `created_at`, `updated_at`, `created_by`, `description`, `design`,
+`acceptance_criteria`, `prerequisites`, `notes`, `closed_at`, `close_reason`,
+`due_at`, `defer_until`, `estimated_minutes`, `external_ref`, `source_repo`,
+`source_repo_path`, `labels`, `dependency_count`, `dependent_count`.
+
+Selecting only `id`, `title`, `status`, `priority`, `issue_type`, `labels`,
+`dependency_count` or `dependent_count` additionally lets `br list` read the
+narrow projection instead of hydrating full records, the same projection the
+plain text renderer already uses. Selecting any other key still projects the
+output but reads full rows.
+
+This is the `br list` counterpart to `br ready --brief`. `br list --json` has no
+default limit (`DEFAULT_LIST_LIMIT` is 0), so on a large tracker it returns the
+whole matching set with every long field; `--fields` is how an agent asks for a
+payload proportional to the decision it is making.
+
+```bash
+# Lean rows for work selection, then read the one issue you pick
+br list --json --fields id,title,status,priority,issue_type
+br show <id>
+
+# Relations without the long text
+br list --json --fields id,title,labels,dependency_count,dependent_count
+```
+
+Unknown or empty selectors are rejected with the allowed list, and are
+validated even when the result set is empty.
 
 **Examples:**
 ```bash
@@ -578,6 +616,7 @@ br ready [OPTIONS]
 | `--unassigned` | Show only unassigned |
 | `-l, --label <LABEL>` | Filter by label (AND logic) |
 | `--label-any <LABEL>` | Filter by label (OR logic) |
+| `--exclude-label <LABEL>` | Hide issues carrying this label (can repeat; any match hides). `--limit` applies after the exclusion |
 | `-t, --type <TYPE>` | Filter by type |
 | `-p, --priority <N>` | Filter by priority |
 | `--sort <POLICY>` | Sort: hybrid (default), priority, oldest |
@@ -587,12 +626,33 @@ br ready [OPTIONS]
 | `--wrap` | Wrap long lines instead of truncating in text output |
 | `--format <FMT>` | Output format: text, json, toon |
 | `--stats` | Show token savings stats when using TOON output |
+| `--brief` | Omit long free-text fields from JSON/TOON output (see below) |
 | `--robot` | Machine-readable output |
+
+**`--brief` (agent work selection):**
+
+JSON and TOON output hydrates the full issue record, including `description`,
+`design`, `acceptance_criteria` and `notes`. On a large tracker those dominate
+the payload: with 1,003 ready issues on a 10,000-issue workspace,
+`br ready --json` returned 1,242,094 bytes and `description` alone accounted
+for 1,002,000 of the 1,121,836 bytes of field content (89.3%).
+
+`--brief` selects the same projection the text renderer already uses — `id`,
+`title`, `status`, `priority`, `issue_type`, `created_at`, `updated_at` — which
+is everything needed to *choose* work. Read the detail of the issue you picked
+with `br show <id>`.
+
+`--brief` changes which **columns** are hydrated, never which **rows** are
+returned: the ready set, its order, and every filter behave identically. Note
+`--robot` is an alias for `--json` and does not by itself reduce payload size.
 
 **Examples:**
 ```bash
 # My ready work
 br ready --assignee $(whoami)
+
+# Agent work selection: same rows, without the long free text
+br ready --brief --json
 
 # Unassigned high-priority
 br ready --unassigned -p 0 -p 1
@@ -1023,6 +1083,9 @@ br search "authentication"
 
 # Search with filters
 br search "bug" -t bug --assignee alice
+
+# Leave out work that belongs to another workstation or team
+br search "parser" --exclude-label subsystem-b
 ```
 
 ---
@@ -1052,6 +1115,7 @@ br count [OPTIONS]
 | `--include-closed` | Include closed issues; use `--status tombstone` for tombstones |
 | `--include-templates` | Include template issues |
 | `--title-contains <TEXT>` | Title contains substring |
+| `--exclude-label <LABEL>` | Hide issues carrying this label (can repeat; any match hides) |
 
 **Examples:**
 ```bash
@@ -1474,11 +1538,46 @@ workflow:
 ```
 
 This lets a bug move from `draft` directly to `open`. Tasks and unconfigured
-types still go through `planned`. All issues must first enter through the
-global `initial` rule. A class edge adds permission for that exact move;
-required fields, fresh transition comments, gates, and capacity still apply.
-Omitting `class_transitions` preserves the global routes. With `strict: false`,
-route and status enforcement remains advisory.
+types still go through `planned`. A class edge adds permission for that exact
+move; required fields, fresh transition comments, gates, and capacity still
+apply. Omitting `class_transitions` preserves the global routes. With
+`strict: false`, route and status enforcement remains advisory.
+
+For triage/follow-up creation that must skip the global `initial` status, use
+`entry_routes`. An entry route is deliberately narrower than a class edge:
+the new issue must carry both the configured label and at least one
+parent/dependency that resolves to an existing local issue. Neither half is
+sufficient by itself, and an `external:` dependency does not count as tracked
+provenance.
+
+```yaml
+workflow:
+  strict: true
+  statuses: [draft, in_planning, open, closed]
+  transitions:
+    initial: [draft]
+    draft: [in_planning]
+    in_planning: [open]
+  entry_routes:
+    - {label: bug, to: in_planning}
+    - {label: follow-up, to: open}
+```
+
+For example, this may enter `in_planning` directly because the label matches
+and the dependency anchors the new issue to an existing bead:
+
+```bash
+br create 'Parser regression' --status in_planning --labels bug \
+  --deps discovered-from:br-abc
+```
+
+The same command without `--labels bug`, without the existing relation, with
+only an external relation, or with a target status not named by the matching
+route is refused by the ordinary `initial` policy. Entry routes are
+case-insensitive for labels/statuses, reject duplicate label/target pairs, and
+must target a declared status when strict status validation is active. They are
+additive exceptions for normal CLI creation; importing historical issues does
+not reinterpret their initial admission through these routes.
 
 `issue_type` matches the parsed type stored on the issue, case-insensitively;
 it introduces no additional issue field. An update that changes both type and
@@ -1721,7 +1820,7 @@ br sync [OPTIONS]
 
 **Portable source path migration (`--migrate-source-repo-path`):**
 - The default invocation emits a `br.sync.source-repo-path-migration.v1` dry-run receipt. It reconciles JSONL-only and newer shared rows without deleting SQLite-only rows, preserves tombstones, and fails closed on equal-timestamp semantic drift.
-- Every surviving `source_repo_path` is planned for the canonical current workspace directory. The portable `source_repo` display name is preserved rather than replaced by a machine-specific path.
+- Every surviving row's database `source_repo_path` is planned for the canonical current workspace directory, and legacy `source_repo_path` values are stripped from the JSONL, which never carries the machine-local field. The portable `source_repo` display name is preserved rather than replaced by a machine-specific path.
 - Apply requires the exact `plan_sha256` and uses the durable DB/JSONL/base publication saga. If interrupted after the database transaction or JSONL publication, the next migration or merge invocation resumes the pending receipt before starting new work.
 - Migration does not probe Git. Its receipt reports `vcs_status: "not_probed"`; run `br vcs-status --json` separately when staged/worktree state must be reviewed.
 
@@ -2137,9 +2236,36 @@ reports the stage and retained pre-state location. All rehearsal and failure
 artifacts remain available. Run `plan` again after successful recovery; `plan`
 itself remains read-only.
 
-Ordinary commands never upgrade an existing database across a schema-version
-boundary. If the database is on a supported older version, use the explicit
-receipt-bound lifecycle:
+**Stale-schema self-heal.** When a command meets a database on an older schema
+(including the unversioned schema 0 of early `br` and Go `bd`), it first audits
+the database against `issues.jsonl`. An issue row counts as represented when the
+JSONL carries it as a tombstone, carries equivalent content, or carries a copy
+at least as new while the row was never marked dirty. If every row is
+represented, the command upgrades the database and continues, printing one
+`br: tracker database was on schema N ...` line on stderr: schemas 13-18 go
+through the reviewed migration below (recovery bundle and undo command
+retained), older schemas are rebuilt from the JSONL with the old family kept in
+`.beads/.br_recovery`. Explicitly read-only invocations
+(`--no-auto-import --no-auto-flush`) never upgrade.
+
+If any row exists only in the database (absent from the JSONL, an unflushed
+edit, or newer than its JSONL copy), mutations refuse and name those issues,
+and read-only commands read the JSONL directly (as with `--no-db`). Resolve it
+with:
+
+```bash
+br doctor migrate-schema heal --dry-run   # show the audit, change nothing
+br doctor migrate-schema heal             # upgrade, keeping database-only issues
+```
+
+`heal` migrates schemas 13-18 in place (every row kept). For older schemas it
+rebuilds from the JSONL and re-adds the database-only issues as unflushed
+changes, so the next `br sync --flush-only` exports them; unflushed edits that a
+newer JSONL edit already superseded stay only in the backup.
+`--discard-db-only` skips the re-add.
+
+The explicit receipt-bound lifecycle remains available for supported older
+versions:
 
 ```bash
 # Read-only inspection. Save and review the complete JSON receipt.

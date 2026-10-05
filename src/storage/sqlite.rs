@@ -223,6 +223,18 @@ struct CapacityOccupancyRow {
     session: Option<String>,
 }
 
+/// Net label change made by [`SqliteStorage::set_labels`] (GitHub #527).
+///
+/// `added` keeps the order of the requested labels; `removed` keeps the
+/// order the labels were stored in. A label never appears in both lists.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LabelSetChanges {
+    /// Labels the issue did not have before and has now.
+    pub added: Vec<String>,
+    /// Labels the issue had before and no longer has.
+    pub removed: Vec<String>,
+}
+
 /// Observed occupancy of one configured capacity (GitHub #384 phase 6).
 ///
 /// Produced by [`SqliteStorage::capacity_snapshot`] for the observability
@@ -1141,6 +1153,45 @@ fn append_label_or_membership_exists(
         params.push(SqliteValue::from(label.as_str()));
     }
 }
+
+/// Hide issues carrying any of `exclude_labels` (`--exclude-label`, GH #522).
+///
+/// A correlated `NOT EXISTS` binds one parameter per distinct label however
+/// many issues carry it, so the predicate stays bounded where a resolved
+/// `id NOT IN (...)` list would grow with the tracker. The alias keeps the
+/// subquery unambiguous in queries that also join `labels`.
+fn append_label_exclusion_filter(
+    sql: &mut String,
+    params: &mut Vec<SqliteValue>,
+    exclude_labels: &[String],
+) {
+    let unique_labels = unique_label_refs(exclude_labels);
+    if unique_labels.is_empty() {
+        return;
+    }
+
+    let placeholders: Vec<String> = unique_labels.iter().map(|_| "?".to_string()).collect();
+    let _ = write!(
+        sql,
+        " AND NOT EXISTS (
+            SELECT 1
+            FROM labels AS excluded_labels
+            WHERE excluded_labels.issue_id = issues.id
+              AND excluded_labels.label IN ({})
+        )",
+        placeholders.join(",")
+    );
+    for label in unique_labels {
+        params.push(SqliteValue::from(label.as_str()));
+    }
+}
+
+fn has_label_exclusion(filters: &ListFilters) -> bool {
+    filters
+        .exclude_labels
+        .as_ref()
+        .is_some_and(|labels| !labels.is_empty())
+}
 // `fsqlite` starts returning false PRIMARY KEY conflicts when we rewrite
 // existing `export_hashes` rows with a single multi-values INSERT. Batch the
 // DELETE side for efficiency, but re-insert one row at a time for correctness.
@@ -1575,25 +1626,86 @@ enum SearchIssueProjection {
     CommandText,
 }
 
-/// Shared case-insensitive needle match used by every `br search` query path.
+/// Shared **ASCII**-case-insensitive needle match used by every `br search`
+/// SQL query path.
 ///
 /// Matches the issue's title, description, and id, plus the bodies of its
 /// comments (beads_rust#416): agent workflows put durable handoffs and
 /// decisions in comments, so a comment-only token must still be findable.
 /// Binds four identical lowercase needle parameters.
+///
+/// **Folding is ASCII-only on both sides, deliberately** (`beads_rust-whnbi`).
+/// The engine's `lower()` folds ASCII only, and the needle is bound as
+/// `to_ascii_lowercase()`, so the two agree and non-ASCII letters compare
+/// case-*sensitively*. Folding only the needle with `to_lowercase()` would
+/// break the agreement and match strictly less than today: `CAFÉ` currently
+/// finds `CAFÉ` because both sides leave `É` alone.
+///
+/// Making this predicate Unicode-aware is not a one-line change. Measured on
+/// installed `br` 0.6.0, `br search café` returns only the lowercase row and
+/// `br search CAFÉ` only the uppercase row, which is what proves the engine's
+/// `lower()` is ASCII-only even though `fsqlite` is built with the `icu`
+/// feature. A Unicode SQL path would need a registered custom collation or
+/// function, i.e. new machinery in the hot query path.
+///
+/// Users do not see this boundary: `search_unicode_issues` in
+/// `src/cli/commands/search.rs` routes non-ASCII needles through the same
+/// Unicode-aware `Regex` matcher `--desc-contains` already used, before any
+/// pagination. ASCII needles keep this SQL fast path.
+/// `test_search_issues_matches_ascii_case_insensitive_literal_substrings`
+/// pins the boundary from this side.
+///
+/// The comment arm is deliberately **uncorrelated**. The correlated
+/// `EXISTS (... WHERE comments.issue_id = issues.id ...)` form it replaced
+/// re-ran the comment scan once per outer issue row, which is invisible on the
+/// default visible corpus and crippling on a whole-corpus search: on this
+/// repository's own tracker (1,096 issues, 1,756 comments, 1.70 MiB of comment
+/// text) `br search <term> --all` cost 4.5-5.8s even for a needle matching
+/// nothing, while the default corpus answered in 0.14s.
+///
+/// The controlled evidence is one binary, one host, one corpus:
+/// `count_closed_search_matches`, which already used this uncorrelated form,
+/// answered in 0.12s over the same 1,077 closed issues the correlated result
+/// query took 5.9s to scan. After the change the same searches measured
+/// 0.067-0.111s (41x-85x, cross-host so indicative rather than controlled);
+/// `--all` is now faster than the default corpus because it skips the extra
+/// hidden-closed count. Plain `br search <term>` was always fast and is
+/// unchanged (`beads_rust-mwxp`).
+///
+/// `--all` was never the common case, though. Any filter that
+/// `needs_client_filters` recognises — `--priority-min`, `--desc-contains`,
+/// `--notes-contains`, `--id` — sends `count_hidden_closed_matches` down its
+/// client-side branch, which searches the whole closed corpus to count what
+/// the default view hid. So one ordinary flag put a *default* search on this
+/// slow path: `br search engine --priority-min 1` measured **5.62s** against
+/// **0.15s** unfiltered, and **0.190s** after this change. Same story for
+/// `--desc-contains` (5.71s -> 0.114s) and `--id` (5.55s -> 0.096s).
+///
+/// Note `append_label_or_membership_exists` keeps a correlated `EXISTS` over
+/// `labels` on purpose: it was measured at 0.069-0.113s on the same tracker
+/// and needs no change. The difference is not correlation alone but
+/// correlation over an unindexable predicate — `instr(lower(comments.text), ?)`
+/// substring-scans every comment body per outer row, while a label membership
+/// test is an indexable equality over 1,121 short rows.
+///
+/// This is the same shape `SEARCH_COUNT_NEEDLE_PREDICATE` has always used for
+/// whole-corpus counts, which is why the hidden-closed count was fast while
+/// the result query it accompanies was not.
+/// `test_search_result_and_closed_count_predicates_agree` holds the two
+/// spellings to the same results.
 const SEARCH_NEEDLE_PREDICATE: &str = "(instr(lower(title), ?) > 0 \
      OR instr(lower(description), ?) > 0 \
      OR instr(lower(id), ?) > 0 \
-     OR EXISTS (SELECT 1 FROM comments \
-                WHERE comments.issue_id = issues.id \
-                  AND instr(lower(comments.text), ?) > 0))";
+     OR issues.id IN (SELECT comments.issue_id FROM comments \
+                      WHERE instr(lower(comments.text), ?) > 0))";
 
 /// Equivalent search predicate for whole-corpus counts.
 ///
-/// Unlike the result query, the hidden-closed count must inspect every eligible
-/// closed issue. Materializing the matching comment issue IDs once avoids
-/// rerunning the comment lookup for every outer issue while preserving the
-/// exact substring and deduplication semantics of `SEARCH_NEEDLE_PREDICATE`.
+/// Identical to `SEARCH_NEEDLE_PREDICATE`; retained as its own constant because
+/// the count query builds a different surrounding statement. Materializing the
+/// matching comment issue IDs once avoids rerunning the comment lookup for
+/// every outer issue while preserving exact substring and deduplication
+/// semantics.
 const SEARCH_COUNT_NEEDLE_PREDICATE: &str = "(instr(lower(title), ?) > 0 \
      OR instr(lower(description), ?) > 0 \
      OR instr(lower(id), ?) > 0 \
@@ -1887,6 +1999,17 @@ pub(crate) struct ReconcileTransactionOutcome<T> {
     pub value: T,
     pub foreign_keys_restored: bool,
     pub database_authority_preserved: bool,
+}
+
+/// How a JSONL import UPDATE treats the machine-local `source_repo_path`
+/// (GitHub #528).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImportSourceRepoPath {
+    /// Keep the row's own path; an incoming value only fills an empty one.
+    KeepLocal,
+    /// Replace the row's path with the incoming value (the explicit
+    /// `--migrate-source-repo-path` rewrite).
+    Overwrite,
 }
 
 impl SqliteStorage {
@@ -2603,13 +2726,39 @@ impl SqliteStorage {
         // — surfaces here as a bare `CannotOpen`, and this lane is the first
         // open every read command and the pending-saga gate perform, so it
         // must carry the same explanation the writable open does.
-        let conn = open_engine_connection_explained(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        //
+        // The engine gets the first attempt, including its own transient
+        // retries, so a family it admits reads exactly as before. Only when
+        // it refuses with `BusyRecovery` and the index is settled-stale
+        // (GH #521) does the read move to a private snapshot.
+        let conn = match open_engine_connection_explained(path, OpenFlags::SQLITE_OPEN_READ_ONLY) {
+            Ok(conn) => conn,
+            Err(BeadsError::Database(FrankenError::BusyRecovery))
+                if allow_snapshot && stale_read_only_wal_index(path)? =>
+            {
+                return Self::open_private_wal_snapshot(path, opener_lease);
+            }
+            Err(error) => return Err(error),
+        };
         // Now that the connection is open, consult the effective schema version
         // (WAL-aware) and fall back to the header peek. Reviewed reconciliation
         // is intentionally exact-version only: a future schema may add columns,
         // triggers, or invariants that this binary cannot witness safely.
+        let probed_version = conn.query_row("PRAGMA user_version");
+        if allow_snapshot
+            && matches!(probed_version, Err(FrankenError::BusyRecovery))
+            && stale_read_only_wal_index(path)?
+        {
+            conn.close().map_err(BeadsError::Database)?;
+            return Self::open_private_wal_snapshot(path, opener_lease);
+        }
+        let connection_version = probed_version.ok().and_then(|row| {
+            row.get(0)
+                .and_then(SqliteValue::as_integer)
+                .and_then(|v| u32::try_from(v).ok())
+        });
         let header_version = checked_database_header_user_version(path)?;
-        if connection_user_version(&conn).or(header_version) != Some(current_schema_version) {
+        if connection_version.or(header_version) != Some(current_schema_version) {
             conn.close().map_err(BeadsError::Database)?;
             return Ok(None);
         }
@@ -2631,14 +2780,29 @@ impl SqliteStorage {
         path: &Path,
         source_lease: Option<crate::sync::DatabaseOpenerLease>,
     ) -> Result<Option<Self>> {
+        // Stable target so tests and operators can count whole-family copies
+        // (`RUST_LOG=br::read_snapshot=info`).
+        tracing::info!(
+            target: "br::read_snapshot",
+            database = %path.display(),
+            "read-only open is reading a private snapshot of the database family"
+        );
         let directory = tempfile::tempdir()?;
         let copy_path = directory.path().join("snapshot.db");
         let mut family = capture_read_snapshot_family(path)?;
         for member in &mut family {
+            // The live index is only a derived cache the engine refused. The
+            // private copy never inherits it: the engine rebuilds its own from
+            // the validated WAL, which a copied #507 zero-page index would
+            // otherwise latch into `BusyRecovery` again. The live `-shm` stays
+            // captured so a concurrent change still fails verification.
+            if member.suffix == "-shm" {
+                continue;
+            }
             member.copy_to(&copy_path)?;
         }
         verify_read_snapshot_family(&mut family)?;
-        if !missing_read_only_wal_index(&copy_path)? {
+        if !(missing_read_only_wal_index(&copy_path)? || stale_read_only_wal_index(&copy_path)?) {
             return Err(BeadsError::SyncConflict {
                 message: "WAL index topology changed during private snapshot capture".to_string(),
             });
@@ -6771,8 +6935,15 @@ impl SqliteStorage {
         self.mutate("create_issue", actor, |conn, ctx| {
             workflow_policy.validate_status(issue.status.as_str())?;
             // Class-specific edges apply only after creation; every issue
-            // enters through the same configured initial route.
-            workflow_policy.validate_transition(None, issue.status.as_str(), None)?;
+            // enters through the configured initial route, or through a
+            // provenance-backed entry route (GH #503) re-proved here inside
+            // the write transaction.
+            if let Err(initial) =
+                workflow_policy.validate_transition(None, issue.status.as_str(), None)
+                && !Self::create_admitted_by_entry_route(conn, &workflow_policy, issue)?
+            {
+                return Err(initial);
+            }
             // Explicit duplicate check since fsqlite does not enforce
             // UNIQUE constraints on non-rowid columns.
             match conn.query_row_with_params(
@@ -8183,7 +8354,8 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database query fails.
     pub fn get_all_issues_metadata(&self) -> Result<Vec<IssueMetadata>> {
-        let sql = "SELECT id, external_ref, content_hash, updated_at, status FROM issues";
+        let sql =
+            "SELECT id, external_ref, content_hash, updated_at, status, created_at FROM issues";
         let rows = self.conn.query(sql)?;
         let mut metas = Vec::with_capacity(rows.len());
         for row in &rows {
@@ -8202,6 +8374,9 @@ impl SqliteStorage {
                 .map(str::to_string);
             let updated_at = parse_datetime_value(row.get(3))?;
             let status = parse_status(row.get(4).and_then(SqliteValue::as_text));
+            // Only used to tell two issues sharing an id apart (GitHub #512);
+            // an unparseable legacy value just disables that check.
+            let created_at = parse_datetime_value(row.get(5)).ok();
 
             metas.push(IssueMetadata {
                 id,
@@ -8209,6 +8384,7 @@ impl SqliteStorage {
                 content_hash,
                 updated_at,
                 status,
+                created_at,
             });
         }
         Ok(metas)
@@ -8235,6 +8411,41 @@ impl SqliteStorage {
             .filter_map(|row| row.get(0).and_then(SqliteValue::as_text))
             .map(str::to_string)
             .collect())
+    }
+
+    /// Whether a create the global `initial` rule refused is admitted by a
+    /// provenance-backed entry route (GH #503).
+    ///
+    /// The CLI checks the route before any write; this repeats the proof
+    /// inside the create transaction so the storage layer, which every create
+    /// path reaches, never admits on a label alone. At least one parent or
+    /// dependency must name an issue that exists in this database now;
+    /// `external:` references never count as provenance.
+    fn create_admitted_by_entry_route(
+        conn: &Connection,
+        workflow_policy: &crate::close_policy::Workflow,
+        issue: &Issue,
+    ) -> Result<bool> {
+        if workflow_policy.entry_routes.is_empty()
+            || !workflow_policy.allows_entry_route(issue.status.as_str(), &issue.labels, true)
+        {
+            return Ok(false);
+        }
+        for dependency in &issue.dependencies {
+            let target = dependency.depends_on_id.as_str();
+            if target.starts_with("external:") || target == issue.id {
+                continue;
+            }
+            match conn.query_row_with_params(
+                "SELECT 1 FROM issues WHERE id = ? LIMIT 1",
+                &[SqliteValue::from(target)],
+            ) {
+                Ok(_) => return Ok(true),
+                Err(FrankenError::QueryReturnedNoRows) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(false)
     }
 
     fn get_issue_from_conn(conn: &Connection, id: &str) -> Result<Option<Issue>> {
@@ -8452,6 +8663,11 @@ impl SqliteStorage {
         if let Some(ref issue_ids) = label_candidate_ids {
             append_issue_id_membership_filter(&mut sql, &mut params, issue_ids);
         }
+        append_label_exclusion_filter(
+            &mut sql,
+            &mut params,
+            filters.exclude_labels.as_deref().unwrap_or(&[]),
+        );
 
         if let Some(ref statuses) = filters.statuses
             && !statuses.is_empty()
@@ -8658,6 +8874,7 @@ impl SqliteStorage {
                 .labels_or
                 .as_ref()
                 .is_some_and(|labels| !labels.is_empty())
+            || has_label_exclusion(filters)
             || filters
                 .types
                 .as_ref()
@@ -8787,6 +9004,7 @@ impl SqliteStorage {
                 .labels_or
                 .as_ref()
                 .is_some_and(|labels| !labels.is_empty())
+            || has_label_exclusion(filters)
             || filters
                 .types
                 .as_ref()
@@ -8882,6 +9100,7 @@ impl SqliteStorage {
                 .labels_or
                 .as_ref()
                 .is_some_and(|labels| !labels.is_empty())
+            || has_label_exclusion(filters)
             || filters
                 .priorities
                 .as_ref()
@@ -8974,6 +9193,7 @@ impl SqliteStorage {
                 .labels_or
                 .as_ref()
                 .is_some_and(|labels| !labels.is_empty())
+            || has_label_exclusion(filters)
             || filters
                 .types
                 .as_ref()
@@ -9036,6 +9256,7 @@ impl SqliteStorage {
                 .labels_or
                 .as_ref()
                 .is_some_and(|labels| !labels.is_empty())
+            || has_label_exclusion(filters)
             || filters
                 .types
                 .as_ref()
@@ -9177,6 +9398,11 @@ impl SqliteStorage {
         } else if let Some(ref issue_ids) = label_candidate_ids {
             append_issue_id_membership_filter(&mut sql, &mut params, issue_ids);
         }
+        append_label_exclusion_filter(
+            &mut sql,
+            &mut params,
+            filters.exclude_labels.as_deref().unwrap_or(&[]),
+        );
 
         if let Some(ref statuses) = filters.statuses
             && !statuses.is_empty()
@@ -9553,6 +9779,11 @@ impl SqliteStorage {
         } else if let Some(ref issue_ids) = label_candidate_ids {
             append_issue_id_membership_filter(&mut sql, &mut params, issue_ids);
         }
+        append_label_exclusion_filter(
+            &mut sql,
+            &mut params,
+            filters.exclude_labels.as_deref().unwrap_or(&[]),
+        );
 
         if let Some(ref statuses) = filters.statuses
             && !statuses.is_empty()
@@ -9714,6 +9945,11 @@ impl SqliteStorage {
         if let Some(ref issue_ids) = label_candidate_ids {
             append_issue_id_membership_filter(&mut sql, &mut params, issue_ids);
         }
+        append_label_exclusion_filter(
+            &mut sql,
+            &mut params,
+            filters.exclude_labels.as_deref().unwrap_or(&[]),
+        );
 
         if let Some(ref statuses) = filters.statuses
             && !statuses.is_empty()
@@ -9885,6 +10121,11 @@ impl SqliteStorage {
                 None => {}
             }
         }
+        append_label_exclusion_filter(
+            &mut sql,
+            &mut params,
+            filters.exclude_labels.as_deref().unwrap_or(&[]),
+        );
 
         if let Some(ref types) = filters.types
             && !types.is_empty()
@@ -10087,6 +10328,10 @@ impl SqliteStorage {
         sort: ReadySortPolicy,
         projection: ReadyIssueProjection,
     ) -> Result<Vec<Issue>> {
+        if !filters.exclude_labels.is_empty() {
+            return self.get_ready_issues_excluding_labels(filters, sort, projection);
+        }
+
         let readiness = self.ready_readiness_probe(filters)?;
         if !readiness.has_candidate_status {
             return Ok(Vec::new());
@@ -10147,6 +10392,42 @@ impl SqliteStorage {
                 )
             }
         }
+    }
+
+    /// Ready issues minus those carrying any `exclude_labels` (GH #522).
+    ///
+    /// The exclusion is resolved in Rust, not SQL: the ready candidate query
+    /// switches to a label JOIN for several filter shapes, and the embedded
+    /// engine has mis-evaluated subqueries under that JOIN before (#307). The
+    /// underlying query therefore runs without a limit, so rows removed here
+    /// cannot leave a short page; the caller's limit is applied afterwards,
+    /// on the already-sorted result.
+    fn get_ready_issues_excluding_labels(
+        &self,
+        filters: &ReadyFilters,
+        sort: ReadySortPolicy,
+        projection: ReadyIssueProjection,
+    ) -> Result<Vec<Issue>> {
+        let mut inner = filters.clone();
+        inner.exclude_labels = Vec::new();
+        let Some(excluded_ids) = self.query_issue_ids_with_any_label(&filters.exclude_labels)?
+        else {
+            return self.get_ready_issues_with_projection(&inner, sort, projection);
+        };
+        if excluded_ids.is_empty() {
+            return self.get_ready_issues_with_projection(&inner, sort, projection);
+        }
+
+        inner.limit = None;
+        let excluded_ids: HashSet<String> = excluded_ids.into_iter().collect();
+        let mut issues = self.get_ready_issues_with_projection(&inner, sort, projection)?;
+        issues.retain(|issue| !excluded_ids.contains(&issue.id));
+        if let Some(limit) = filters.limit
+            && limit > 0
+        {
+            issues.truncate(limit);
+        }
+        Ok(issues)
     }
 
     /// Resolve the set of issue IDs matched by a `--parent` filter on `ready`.
@@ -13632,10 +13913,19 @@ impl SqliteStorage {
 
     /// Set all labels for an issue (replace existing).
     ///
+    /// Returns the labels the replacement actually added and removed, so
+    /// callers can report the change without a second read (GitHub #527).
+    /// Both lists are empty when the issue already carried exactly `labels`.
+    ///
     /// # Errors
     ///
     /// Returns an error if the database update fails.
-    pub fn set_labels(&mut self, issue_id: &str, labels: &[String], actor: &str) -> Result<()> {
+    pub fn set_labels(
+        &mut self,
+        issue_id: &str,
+        labels: &[String],
+        actor: &str,
+    ) -> Result<LabelSetChanges> {
         self.mutate("set_labels", actor, |conn, ctx| {
             Self::ensure_issue_mutable_in_tx(conn, issue_id, "set labels on")?;
 
@@ -13658,7 +13948,7 @@ impl SqliteStorage {
             let db_has_duplicate_labels = old_labels_raw.len() != old_labels.len();
 
             if old_matches_desired && !db_has_duplicate_labels {
-                return Ok(());
+                return Ok(LabelSetChanges::default());
             }
 
             conn.execute_with_params(
@@ -13731,7 +14021,10 @@ impl SqliteStorage {
                 )?;
             }
 
-            Ok(())
+            Ok(LabelSetChanges {
+                added: added.into_iter().cloned().collect(),
+                removed: removed.into_iter().cloned().collect(),
+            })
         })
     }
 
@@ -17202,14 +17495,37 @@ fn verify_read_snapshot_family(family: &mut [ReadSnapshotMember]) -> Result<()> 
     Ok(())
 }
 
+/// Whether a read-only open that the engine just refused with `BusyRecovery`
+/// (after its own transient retries) is facing a settled WAL index the engine
+/// can never admit read-only: one left by br 0.6.0's engine, which never
+/// maintained it, or one from another WAL generation (GH #521), or the
+/// initialized zero-page index of #507 (beside a WAL that holds frames, or
+/// without stock SQLite's header checksum). Only a writable open can rebuild
+/// such an index, so the read goes through a private snapshot whose index is
+/// rebuilt off to the side, never touching the live family. Writable opens keep #507's identity-bound quarantine.
+///
+/// Stock SQLite's unindexed empty index beside a header-only WAL, which any
+/// SQLite reader of the tracker (bv, the sqlite3 shell) leaves behind, is not
+/// one of these: FrankenSQLite 0.4.6+ admits it for reads (fsqlite GH#431),
+/// so a `BusyRecovery` there is ordinary contention and never worth a copy of
+/// the whole family.
+fn stale_read_only_wal_index(path: &Path) -> Result<bool> {
+    // A zero-page index (salts and szPage zero) also disagrees with any valid
+    // WAL header on page size, so the stale classifier covers #507 as well.
+    Ok(crate::franken_sync::wal_index::stale_index_present(path)?
+        && !crate::franken_sync::wal_index::stock_empty_index_present(path)?)
+}
+
 fn missing_read_only_wal_index(path: &Path) -> Result<bool> {
     let shm = StableSchemaSource::open_optional(&database_sidecar_path(path, "-shm"), "SHM")?;
     if shm.is_some() {
         return Ok(false);
     }
+    // A WAL shorter than its 32-byte header holds no frames and therefore has
+    // no index to rebuild; the ordinary open path handles it.
     Ok(
         StableSchemaSource::open_optional(&database_sidecar_path(path, "-wal"), "WAL")?
-            .is_some_and(|source| source.initial_len > 0),
+            .is_some_and(|source| source.initial_len >= 32),
     )
 }
 
@@ -17469,10 +17785,23 @@ fn scan_wal_schema_preflight(
         });
     }
     if wal_len < 32 {
+        // SQLite's WAL recovery reads nothing from a file shorter than its
+        // 32-byte header: without the header's salts no frame can validate, so
+        // such a WAL carries no committed state and the main database header is
+        // authoritative. Observational preflight therefore treats it exactly
+        // like an empty WAL. Index recovery still refuses it: there is no index
+        // to rebuild, and startup quarantines the torn sidecar under authority
+        // instead (`quarantine_torn_wal_for_startup`).
+        if recovery_page_size.is_none() {
+            wal_source.verify_path(&wal_path, "WAL")?;
+            return Ok(WalSchemaPreflight {
+                committed_user_version: None,
+                has_committed_frames: false,
+            });
+        }
         return Err(BeadsError::SyncConflict {
             message: format!(
-                "Refusing schema preflight because the {}-byte WAL header is truncated",
-                wal_len
+                "Refusing WAL index recovery because the {wal_len}-byte WAL header is truncated"
             ),
         });
     }
@@ -18281,7 +18610,7 @@ pub(crate) fn probe_read_only_open_is_observational(db_path: &Path) -> Result<Re
     })
 }
 
-fn effective_database_user_version(path: &Path) -> Result<Option<u32>> {
+pub(crate) fn effective_database_user_version(path: &Path) -> Result<Option<u32>> {
     if checked_database_header_user_version(path)?.is_none() {
         return Ok(None);
     }
@@ -18321,6 +18650,9 @@ pub struct ListFilters {
     pub labels: Option<Vec<String>>,
     /// Filter by labels (OR logic)
     pub labels_or: Option<Vec<String>>,
+    /// Hide issues carrying any of these labels. Applied after `labels` and
+    /// `labels_or`, so it narrows whatever those select.
+    pub exclude_labels: Option<Vec<String>>,
     /// Filter by `updated_at` <= timestamp
     pub updated_before: Option<DateTime<Utc>>,
     /// Filter by `updated_at` >= timestamp
@@ -18480,6 +18812,8 @@ pub struct ReadyFilters {
     pub unassigned: bool,
     pub labels_and: Vec<String>,
     pub labels_or: Vec<String>,
+    /// Hide issues carrying any of these labels.
+    pub exclude_labels: Vec<String>,
     pub types: Option<Vec<IssueType>>,
     pub priorities: Option<Vec<Priority>>,
     pub include_deferred: bool,
@@ -18519,6 +18853,8 @@ pub struct IssueMetadata {
     pub content_hash: Option<String>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
     pub status: crate::model::Status,
+    /// Creation time; `None` when the stored value cannot be parsed.
+    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Sort policy for ready issues.
@@ -18567,6 +18903,7 @@ fn default_visible_limited_page_limit(filters: &ListFilters) -> Option<usize> {
         && !filters.reverse
         && filters.labels.as_ref().is_none_or(Vec::is_empty)
         && filters.labels_or.as_ref().is_none_or(Vec::is_empty)
+        && !has_label_exclusion(filters)
         && filters.updated_before.is_none()
         && filters.updated_after.is_none();
 
@@ -18589,6 +18926,7 @@ fn default_visible_single_label_count_filter(filters: &ListFilters) -> Option<&s
         && !filters.include_templates
         && filters.title_contains.is_none()
         && filters.labels_or.as_ref().is_none_or(Vec::is_empty)
+        && !has_label_exclusion(filters)
         && filters.updated_before.is_none()
         && filters.updated_after.is_none();
 
@@ -19913,30 +20251,59 @@ impl SqliteStorage {
         Ok(rows)
     }
 
+    /// Overwrite an existing row from an imported issue. `source_repo_path`
+    /// is machine-local and JSONL rows no longer carry it (GitHub #528): the
+    /// row's own path wins, and an incoming value only fills a row that has
+    /// none. A legacy row exported by an older br carries the exporting
+    /// machine's path, which never names this machine's workspace, so it must
+    /// not replace the local one. Only the explicit source_repo_path migration
+    /// passes [`ImportSourceRepoPath::Overwrite`].
     fn update_issue_row_for_import(
         &self,
         issue: &Issue,
         timestamps: &ImportIssueTimestampStrings,
+        source_repo_path: ImportSourceRepoPath,
     ) -> Result<usize> {
         let mut params = Self::import_issue_field_values(issue, timestamps);
         params.push(SqliteValue::from(issue.id.as_str()));
-        let rows = self.conn.execute_with_params(
-            r"UPDATE issues SET
+        let sql = match source_repo_path {
+            ImportSourceRepoPath::KeepLocal => Self::IMPORT_UPDATE_KEEP_LOCAL_SOURCE_REPO_PATH_SQL,
+            ImportSourceRepoPath::Overwrite => Self::IMPORT_UPDATE_OVERWRITE_SOURCE_REPO_PATH_SQL,
+        };
+        let rows = self.conn.execute_with_params(sql, &params)?;
+
+        Ok(rows)
+    }
+
+    /// Import UPDATE that keeps a row's machine-local `source_repo_path`
+    /// and only fills it when the row has none (GitHub #528).
+    const IMPORT_UPDATE_KEEP_LOCAL_SOURCE_REPO_PATH_SQL: &'static str = r"UPDATE issues SET
                 content_hash = ?, title = ?, description = ?, design = ?,
                 acceptance_criteria = ?, notes = ?, status = ?, priority = ?,
                 issue_type = ?, assignee = ?, owner = ?, estimated_minutes = ?,
                 created_at = ?, created_by = ?, updated_at = ?, closed_at = ?,
                 close_reason = ?, closed_by_session = ?, due_at = ?, defer_until = ?,
-                external_ref = ?, source_system = ?, source_repo = ?, source_repo_path = ?,
+                external_ref = ?, source_system = ?, source_repo = ?,
+                source_repo_path = COALESCE(source_repo_path, ?),
                 deleted_at = ?, deleted_by = ?, delete_reason = ?, original_type = ?, compaction_level = ?,
                 compacted_at = ?, compacted_at_commit = ?, original_size = ?, sender = ?,
                 ephemeral = ?, pinned = ?, is_template = ?, agent_context = ?, prerequisites = ?
-              WHERE id = ?",
-            &params,
-        )?;
+              WHERE id = ?";
 
-        Ok(rows)
-    }
+    /// Import UPDATE that sets `source_repo_path` from the incoming issue;
+    /// reserved for the explicit source_repo_path migration.
+    const IMPORT_UPDATE_OVERWRITE_SOURCE_REPO_PATH_SQL: &'static str = r"UPDATE issues SET
+                content_hash = ?, title = ?, description = ?, design = ?,
+                acceptance_criteria = ?, notes = ?, status = ?, priority = ?,
+                issue_type = ?, assignee = ?, owner = ?, estimated_minutes = ?,
+                created_at = ?, created_by = ?, updated_at = ?, closed_at = ?,
+                close_reason = ?, closed_by_session = ?, due_at = ?, defer_until = ?,
+                external_ref = ?, source_system = ?, source_repo = ?,
+                source_repo_path = ?,
+                deleted_at = ?, deleted_by = ?, delete_reason = ?, original_type = ?, compaction_level = ?,
+                compacted_at = ?, compacted_at_commit = ?, original_size = ?, sender = ?,
+                ephemeral = ?, pinned = ?, is_template = ?, agent_context = ?, prerequisites = ?
+              WHERE id = ?";
 
     /// Insert a new issue during JSONL import without first probing for existence.
     ///
@@ -19977,6 +20344,17 @@ impl SqliteStorage {
     }
 
     pub(crate) fn upsert_issue_for_import_in_tx(&self, issue: &Issue) -> Result<bool> {
+        self.upsert_issue_for_import_with_source_repo_path_in_tx(
+            issue,
+            ImportSourceRepoPath::KeepLocal,
+        )
+    }
+
+    fn upsert_issue_for_import_with_source_repo_path_in_tx(
+        &self,
+        issue: &Issue,
+        source_repo_path: ImportSourceRepoPath,
+    ) -> Result<bool> {
         let timestamps = ImportIssueTimestampStrings::from_issue(issue);
 
         // Narrow existence probe: don't deserialize the row, just check
@@ -19992,7 +20370,7 @@ impl SqliteStorage {
         };
 
         if issue_exists {
-            let rows = self.update_issue_row_for_import(issue, &timestamps)?;
+            let rows = self.update_issue_row_for_import(issue, &timestamps, source_repo_path)?;
             if rows == 0 {
                 return Err(BeadsError::Database(FrankenError::Internal(format!(
                     "import update did not find existing issue {}",
@@ -20700,8 +21078,16 @@ impl SqliteStorage {
             // Materialize every issue row before validating/inserting
             // dependency relations so references between two newly merged
             // rows do not depend on report ordering.
+            // GitHub #528: kept rows keep this machine's source_repo_path;
+            // only the source_repo_path migration exists to replace it.
+            let source_repo_path = if intent.resolution == "source-repo-path-migration" {
+                ImportSourceRepoPath::Overwrite
+            } else {
+                ImportSourceRepoPath::KeepLocal
+            };
             for issue in kept {
-                storage.upsert_issue_for_import_in_tx(issue)?;
+                storage
+                    .upsert_issue_for_import_with_source_repo_path_in_tx(issue, source_repo_path)?;
             }
             for issue in kept {
                 storage.sync_labels_for_import_in_tx(&issue.id, &issue.labels)?;
@@ -22305,6 +22691,110 @@ required_fields:
                     .unwrap()
             )
         })
+    }
+
+    #[test]
+    fn entry_route_storage_admits_only_with_label_and_existing_relation() {
+        let mut workflow = class_transition_workflow();
+        workflow.entry_routes.push(crate::close_policy::EntryRoute {
+            label: "triage".to_owned(),
+            to: "open".to_owned(),
+        });
+        workflow.validate_entry_routes().unwrap();
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        storage.set_workflow_policy(workflow);
+        let anchor = make_issue(
+            "bd-anchor",
+            "Anchor",
+            Status::Draft,
+            2,
+            None,
+            Utc::now(),
+            None,
+        );
+        storage.create_issue(&anchor, "route-tester").unwrap();
+
+        let relation = |issue_id: &str, target: &str, dep_type| Dependency {
+            issue_id: issue_id.to_owned(),
+            depends_on_id: target.to_owned(),
+            dep_type,
+            created_at: Utc::now(),
+            created_by: None,
+            metadata: None,
+            thread_id: None,
+        };
+        let candidate = |id: &str, status, labels: &[&str], deps: Vec<Dependency>| {
+            let mut issue = make_issue(id, id, status, 2, None, Utc::now(), None);
+            issue.labels = labels.iter().map(|label| (*label).to_owned()).collect();
+            issue.dependencies = deps;
+            issue
+        };
+        let before = class_transition_rows(&storage);
+        for issue in [
+            candidate("bd-label-only", Status::Open, &["triage"], vec![]),
+            candidate(
+                "bd-relation-only",
+                Status::Open,
+                &[],
+                vec![relation(
+                    "bd-relation-only",
+                    "bd-anchor",
+                    DependencyType::DiscoveredFrom,
+                )],
+            ),
+            candidate(
+                "bd-external",
+                Status::Open,
+                &["triage"],
+                vec![relation(
+                    "bd-external",
+                    "external:ticket-42",
+                    DependencyType::Related,
+                )],
+            ),
+            candidate(
+                "bd-missing",
+                Status::Open,
+                &["triage"],
+                vec![relation(
+                    "bd-missing",
+                    "bd-nowhere",
+                    DependencyType::DiscoveredFrom,
+                )],
+            ),
+            candidate(
+                "bd-wrong-target",
+                "planned".parse::<Status>().unwrap(),
+                &["triage"],
+                vec![relation(
+                    "bd-wrong-target",
+                    "bd-anchor",
+                    DependencyType::DiscoveredFrom,
+                )],
+            ),
+        ] {
+            let error = storage.create_issue(&issue, "route-tester").unwrap_err();
+            assert!(
+                matches!(error, BeadsError::Validation { .. }),
+                "{}: {error}",
+                issue.id
+            );
+            assert_eq!(class_transition_rows(&storage), before, "{}", issue.id);
+        }
+
+        let admitted = candidate(
+            "bd-admitted",
+            Status::Open,
+            &["TRIAGE"],
+            vec![relation(
+                "bd-admitted",
+                "bd-anchor",
+                DependencyType::DiscoveredFrom,
+            )],
+        );
+        storage.create_issue(&admitted, "route-tester").unwrap();
+        let stored = storage.get_issue("bd-admitted").unwrap().unwrap();
+        assert_eq!(stored.status, Status::Open);
     }
 
     #[test]
@@ -27079,6 +27569,78 @@ required_fields:
     }
 
     #[test]
+    fn test_import_update_keeps_local_source_repo_path() {
+        // GitHub #528: JSONL rows no longer carry the machine-local path, so
+        // importing a peer's edit must neither erase nor replace this
+        // machine's value.
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 5, 1, 0, 0, 0).unwrap();
+        let mut issue = make_issue("bd-lp", "local path", Status::Open, 2, None, t1, None);
+        issue.source_repo_path = Some("/data/projects/widget_engine".to_string());
+        storage.create_issue(&issue, "tester").unwrap();
+
+        let mut pulled = storage.get_issue("bd-lp").unwrap().unwrap();
+        pulled.title = "edited by a peer".to_string();
+        pulled.source_repo_path = None;
+        assert!(storage.upsert_issue_for_import(&pulled).unwrap());
+        let reread = storage.get_issue("bd-lp").unwrap().unwrap();
+        assert_eq!(reread.title, "edited by a peer");
+        assert_eq!(
+            reread.source_repo_path.as_deref(),
+            Some("/data/projects/widget_engine")
+        );
+
+        // A legacy row from an older br carries the exporting machine's path;
+        // it must not replace this machine's own value.
+        pulled.source_repo_path = Some("/home/peer/widget_engine".to_string());
+        pulled.title = "edited by an older peer".to_string();
+        assert!(storage.upsert_issue_for_import(&pulled).unwrap());
+        let reread = storage.get_issue("bd-lp").unwrap().unwrap();
+        assert_eq!(reread.title, "edited by an older peer");
+        assert_eq!(
+            reread.source_repo_path.as_deref(),
+            Some("/data/projects/widget_engine")
+        );
+
+        // A row with no local path adopts the legacy value.
+        let mut bare = make_issue("bd-np", "no local path", Status::Open, 2, None, t1, None);
+        storage.create_issue(&bare, "tester").unwrap();
+        bare.source_repo_path = Some("/home/peer/widget_engine".to_string());
+        assert!(storage.upsert_issue_for_import(&bare).unwrap());
+        assert_eq!(
+            storage
+                .get_issue("bd-np")
+                .unwrap()
+                .unwrap()
+                .source_repo_path
+                .as_deref(),
+            Some("/home/peer/widget_engine")
+        );
+
+        // Only the explicit migration replaces a local path.
+        pulled.source_repo_path = Some("/srv/canonical/widget_engine".to_string());
+        assert!(
+            storage
+                .with_connection_write_transaction(|_| {
+                    storage.upsert_issue_for_import_with_source_repo_path_in_tx(
+                        &pulled,
+                        ImportSourceRepoPath::Overwrite,
+                    )
+                })
+                .unwrap()
+        );
+        assert_eq!(
+            storage
+                .get_issue("bd-lp")
+                .unwrap()
+                .unwrap()
+                .source_repo_path
+                .as_deref(),
+            Some("/srv/canonical/widget_engine")
+        );
+    }
+
+    #[test]
     fn test_update_issue_same_priority_is_noop() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let t1 = Utc.with_ymd_and_hms(2025, 5, 1, 0, 0, 0).unwrap();
@@ -28441,7 +29003,7 @@ required_fields:
         let issue = make_issue("bd-l2", "Dedup labels", Status::Open, 2, None, t1, None);
         storage.create_issue(&issue, "tester").unwrap();
 
-        storage
+        let changes = storage
             .set_labels(
                 "bd-l2",
                 &[
@@ -28452,9 +29014,33 @@ required_fields:
                 "tester",
             )
             .unwrap();
+        assert_eq!(
+            changes,
+            LabelSetChanges {
+                added: vec!["backend".to_string(), "api".to_string()],
+                removed: Vec::new(),
+            }
+        );
 
         let labels = storage.get_labels("bd-l2").unwrap();
         assert_eq!(labels, vec!["api".to_string(), "backend".to_string()]);
+
+        // GitHub #527: the return value is the net change, and empty when
+        // the replacement matches what is stored.
+        let changes = storage
+            .set_labels("bd-l2", &["api".to_string(), "ui".to_string()], "tester")
+            .unwrap();
+        assert_eq!(
+            changes,
+            LabelSetChanges {
+                added: vec!["ui".to_string()],
+                removed: vec!["backend".to_string()],
+            }
+        );
+        let changes = storage
+            .set_labels("bd-l2", &["ui".to_string(), "api".to_string()], "tester")
+            .unwrap();
+        assert_eq!(changes, LabelSetChanges::default());
     }
 
     #[test]
@@ -33636,13 +34222,18 @@ required_fields:
             )
             .unwrap(),
         );
-        crate::cli::commands::doctor_subsystems::schema_migration::recover_missing_wal_index(
+        crate::cli::commands::doctor_subsystems::schema_migration::recover_wal_index_for_startup(
             temp.path(),
             &db_path,
             &authority,
         )
         .unwrap();
-        assert!(shm_path.is_file());
+        // An engine with a private in-memory index (Windows) needs no file
+        // and must not be sent through recovery for its absence (GH #520).
+        assert_eq!(
+            shm_path.is_file(),
+            crate::franken_sync::wal_index::STARTUP_WAL_INDEX_RECOVERY
+        );
         assert_eq!(
             SqliteStorage::inspect_pending_sync_merge_under_authority(&db_path, &authority)
                 .unwrap(),
@@ -33919,6 +34510,64 @@ required_fields:
             None,
             "without any valid commit the database header remains authoritative"
         );
+    }
+
+    /// A WAL shorter than its 32-byte header is frameless under SQLite's
+    /// recovery rule, so observational preflight must treat it like an empty
+    /// WAL (no committed state, main header authoritative) without touching it,
+    /// while index recovery still refuses to rebuild an index for it. A full
+    /// 32-byte header keeps the existing validation in both directions.
+    #[test]
+    fn test_wal_preflight_treats_torn_header_as_frameless_without_rewriting_it() {
+        for length in [1_usize, 20, 31] {
+            let temp = TempDir::new().unwrap();
+            let db_path = temp.path().join(format!("torn_{length}.db"));
+            let wal_path = database_sidecar_path(&db_path, "-wal");
+            let torn = vec![0xA5_u8; length];
+            fs::write(&wal_path, &torn).unwrap();
+
+            let preflight = sqlite_wal_schema_preflight(&db_path)
+                .unwrap_or_else(|error| panic!("{length}-byte torn WAL refused: {error}"));
+            assert!(
+                !preflight.has_committed_frames,
+                "{length}-byte torn WAL cannot hold a committed frame"
+            );
+            assert_eq!(preflight.committed_user_version, None);
+            assert_eq!(
+                fs::read(&wal_path).unwrap(),
+                torn,
+                "preflight rewrote the WAL"
+            );
+
+            let error = scan_wal_schema_preflight(&db_path, Some(512))
+                .expect_err("index recovery has no index to rebuild for a torn WAL");
+            assert!(
+                error.to_string().contains("header is truncated"),
+                "unexpected {length}-byte recovery refusal: {error}"
+            );
+            assert_eq!(
+                fs::read(&wal_path).unwrap(),
+                torn,
+                "recovery rewrote the WAL"
+            );
+        }
+
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("header_only.db");
+        let wal_path = database_sidecar_path(&db_path, "-wal");
+        let (header, _) = synthetic_wal_header((0x0BAD_F00D, 0x1234_5678));
+        assert_eq!(header.len(), 32);
+        fs::write(&wal_path, &header).unwrap();
+        let preflight = sqlite_wal_schema_preflight(&db_path).unwrap();
+        assert!(!preflight.has_committed_frames);
+        assert_eq!(preflight.committed_user_version, None);
+
+        let mut garbage = header;
+        garbage[0] ^= 0xFF;
+        fs::write(&wal_path, &garbage).unwrap();
+        let error = sqlite_wal_schema_preflight(&db_path)
+            .expect_err("a complete header with invalid magic is still refused");
+        assert!(error.to_string().contains("magic"), "{error}");
     }
 
     #[test]
@@ -35982,8 +36631,23 @@ required_fields:
         assert_eq!(results[0].id, "bd-s1");
     }
 
+    /// Pin what the SQL needle path actually folds, from the storage side.
+    ///
+    /// Renamed from `test_search_issues_matches_case_insensitive_literal_substrings`
+    /// for `beads_rust-whnbi`: the old name claimed plain case-insensitivity,
+    /// which is false for non-ASCII and had no assertion covering it. This
+    /// layer folds ASCII only, on both the column (`lower()`) and the needle
+    /// (`to_ascii_lowercase`), and the non-ASCII assertions below hold it to
+    /// exactly that. Unicode needles never reach here: the command layer
+    /// diverts them to a `Regex` matcher (`search_unicode_issues`), which is
+    /// what `tests/repro_search_unicode.rs` covers end to end.
+    ///
+    /// The `É` case matters beyond bookkeeping. Both sides leaving `É` alone is
+    /// what makes an uppercase needle find uppercase-stored text today, so
+    /// folding only the needle to `to_lowercase()` would match strictly less
+    /// than the status quo, not more. That trap is why this is pinned.
     #[test]
-    fn test_search_issues_matches_case_insensitive_literal_substrings() {
+    fn test_search_issues_matches_ascii_case_insensitive_literal_substrings() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let t1 = Utc.with_ymd_and_hms(2025, 9, 1, 0, 0, 0).unwrap();
 
@@ -36006,21 +36670,69 @@ required_fields:
             None,
         );
         description_issue.description = Some("Uppercase AUTHENTICATION token".to_string());
+        let mut lower_accent_issue = make_issue(
+            "bd-s-accent-lower",
+            "lower café stored",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        lower_accent_issue.description = Some("desc has café lowercase".to_string());
+        let mut upper_accent_issue = make_issue(
+            "bd-s-accent-upper",
+            "UPPER CAFÉ STORED",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        upper_accent_issue.description = Some("desc has CAFÉ uppercase".to_string());
 
         storage.create_issue(&literal_issue, "tester").unwrap();
         storage.create_issue(&description_issue, "tester").unwrap();
+        storage.create_issue(&lower_accent_issue, "tester").unwrap();
+        storage.create_issue(&upper_accent_issue, "tester").unwrap();
 
         let filters = ListFilters::default();
-        let wildcard_results = storage.search_issues("%_", &filters).unwrap();
-        let wildcard_ids: Vec<_> = wildcard_results
-            .iter()
-            .map(|issue| issue.id.as_str())
-            .collect();
-        assert_eq!(wildcard_ids, vec!["bd-s-literal"]);
+        let ids_for = |storage: &SqliteStorage, needle: &str| -> Vec<String> {
+            storage
+                .search_issues(needle, &filters)
+                .unwrap()
+                .iter()
+                .map(|issue| issue.id.clone())
+                .collect()
+        };
 
-        let case_results = storage.search_issues("authentication", &filters).unwrap();
-        let case_ids: Vec<_> = case_results.iter().map(|issue| issue.id.as_str()).collect();
-        assert_eq!(case_ids, vec!["bd-s-description"]);
+        assert_eq!(ids_for(&storage, "%_"), vec!["bd-s-literal".to_string()]);
+
+        // ASCII folds on both sides, so either casing finds the stored text.
+        assert_eq!(
+            ids_for(&storage, "authentication"),
+            vec!["bd-s-description".to_string()]
+        );
+        assert_eq!(
+            ids_for(&storage, "AUTHENTICATION"),
+            vec!["bd-s-description".to_string()],
+            "ASCII needles must fold regardless of the needle's own casing"
+        );
+
+        // Non-ASCII does NOT fold here. Each accented needle finds only the row
+        // stored in that same case; neither finds the other.
+        assert_eq!(
+            ids_for(&storage, "café"),
+            vec!["bd-s-accent-lower".to_string()],
+            "SQL path folds ASCII only, so a lowercase accented needle must not \
+             reach the uppercase-stored row; Unicode is handled in search.rs"
+        );
+        assert_eq!(
+            ids_for(&storage, "CAFÉ"),
+            vec!["bd-s-accent-upper".to_string()],
+            "the uppercase accented needle must keep working: both sides leave \
+             É alone, and Unicode-folding the needle alone would break this"
+        );
     }
 
     #[test]
@@ -36091,6 +36803,175 @@ required_fields:
                 .unwrap(),
             2,
             "each closed issue must be counted once regardless of how many fields or comments match"
+        );
+    }
+
+    /// The result query and the count query must agree, because they are two
+    /// spellings of one predicate (`beads_rust-mwxp`).
+    ///
+    /// `SEARCH_NEEDLE_PREDICATE` used a correlated `EXISTS (... WHERE
+    /// comments.issue_id = issues.id ...)` that re-ran the comment scan for
+    /// every outer issue row, while `SEARCH_COUNT_NEEDLE_PREDICATE` already
+    /// used the uncorrelated `issues.id IN (SELECT ...)` form. De-correlating
+    /// the result query took `br search <needle> --all` on this repository's
+    /// own tracker from ~5.9s to ~0.05s. This test exists so the two can never
+    /// silently disagree again: it asserts the *set* of matching closed issues
+    /// found by the result query equals the *number* reported by the count
+    /// query, over a corpus that exercises every arm of the predicate.
+    // The length is the point: this builds one closed issue per predicate arm
+    // plus multi-match and no-match controls, so splitting it would separate
+    // the corpus from the assertions that give it meaning. Same remedy the
+    // rest of this file already uses for table-style tests.
+    #[allow(clippy::too_many_lines)]
+    #[test]
+    fn test_search_result_and_closed_count_predicates_agree() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let created_at = Utc.with_ymd_and_hms(2025, 9, 1, 0, 0, 0).unwrap();
+
+        // One closed issue per predicate arm, plus multi-match and no-match
+        // controls, so a regression in any single arm shows up as a mismatch.
+        let mut by_title = make_issue(
+            "bd-agree-title",
+            "needle in the title",
+            Status::Closed,
+            2,
+            None,
+            created_at,
+            None,
+        );
+        by_title.closed_at = Some(created_at);
+
+        let mut by_description = make_issue(
+            "bd-agree-desc",
+            "nothing here",
+            Status::Closed,
+            2,
+            None,
+            created_at,
+            None,
+        );
+        by_description.description = Some("buried NEEDLE in the body".to_string());
+        by_description.closed_at = Some(created_at);
+
+        // Matches only on id, via the substring "needle" inside the id itself.
+        let mut by_id = make_issue(
+            "bd-agree-needle-id",
+            "nothing here either",
+            Status::Closed,
+            2,
+            None,
+            created_at,
+            None,
+        );
+        by_id.closed_at = Some(created_at);
+
+        let mut by_comment = make_issue(
+            "bd-agree-comment",
+            "nothing here at all",
+            Status::Closed,
+            2,
+            None,
+            created_at,
+            None,
+        );
+        by_comment.closed_at = Some(created_at);
+
+        // Matches on several arms and on several comments at once: the count
+        // must still be one, and the result set must still hold it once.
+        let mut multi = make_issue(
+            "bd-agree-needle-multi",
+            "needle everywhere",
+            Status::Closed,
+            2,
+            None,
+            created_at,
+            None,
+        );
+        multi.description = Some("needle again".to_string());
+        multi.closed_at = Some(created_at);
+
+        let mut absent = make_issue(
+            "bd-agree-absent",
+            "no token at all",
+            Status::Closed,
+            2,
+            None,
+            created_at,
+            None,
+        );
+        absent.closed_at = Some(created_at);
+
+        // An OPEN comment match must be excluded from the closed count while
+        // remaining findable by an include-closed result query.
+        let open_comment = make_issue(
+            "bd-agree-open",
+            "open and quiet",
+            Status::Open,
+            2,
+            None,
+            created_at,
+            None,
+        );
+
+        for issue in [
+            by_title,
+            by_description,
+            by_id,
+            by_comment,
+            multi,
+            absent,
+            open_comment,
+        ] {
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+        storage
+            .add_comment("bd-agree-comment", "tester", "handoff mentions NEEDLE once")
+            .unwrap();
+        for text in ["NEEDLE first", "needle second", "NeEdLe third"] {
+            storage
+                .add_comment("bd-agree-needle-multi", "tester", text)
+                .unwrap();
+        }
+        storage
+            .add_comment("bd-agree-open", "tester", "open issue needle comment")
+            .unwrap();
+        storage
+            .add_comment("bd-agree-absent", "tester", "unrelated remark")
+            .unwrap();
+
+        let mut closed_only = ListFilters {
+            statuses: Some(vec![Status::Closed]),
+            include_closed: true,
+            ..ListFilters::default()
+        };
+        closed_only.limit = None;
+
+        let matched: BTreeSet<String> = storage
+            .search_issues("NeEdLe", &closed_only)
+            .unwrap()
+            .into_iter()
+            .map(|issue| issue.id)
+            .collect();
+
+        assert_eq!(
+            matched,
+            BTreeSet::from([
+                "bd-agree-title".to_string(),
+                "bd-agree-desc".to_string(),
+                "bd-agree-needle-id".to_string(),
+                "bd-agree-comment".to_string(),
+                "bd-agree-needle-multi".to_string(),
+            ]),
+            "every predicate arm must match, case-insensitively, and only once each"
+        );
+
+        let counted = storage
+            .count_closed_search_matches("NeEdLe", &ListFilters::default())
+            .unwrap();
+        assert_eq!(
+            counted,
+            matched.len(),
+            "the count query and the result query are one predicate and must agree"
         );
     }
 

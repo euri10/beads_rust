@@ -14,16 +14,16 @@ class Br < Formula
   desc "Agent-first issue tracker (SQLite + JSONL)"
   homepage "https://github.com/Dicklesworthstone/beads_rust"
   license :cannot_represent
-  version "0.6.0"
+  version "0.7.4"
 
   on_macos do
     on_arm do
       url "https://github.com/Dicklesworthstone/beads_rust/releases/download/v#{version}/br-#{version}-darwin_arm64.tar.gz"
-      sha256 "3a0ec90366e724cc88524fc1be6bf6783ff579cb85af1f6d20884c612fcd321e"  # darwin_arm64
+      sha256 "4e7619b919c0f720d0d520c51ce3b1c730387293cb6fe159e1f1cba8512ffad7"  # darwin_arm64
     end
     on_intel do
       url "https://github.com/Dicklesworthstone/beads_rust/releases/download/v#{version}/br-#{version}-darwin_amd64.tar.gz"
-      sha256 "f99da0f6811b86ecc4541cfbab316eb52f93f6f41151128cbeb1fd238f16e343"  # darwin_amd64
+      sha256 "38d2691fcf4921af6d1b4772b8c45c7c8c6dfdbea3b432064fb2ce6a71936e6e"  # darwin_amd64
     end
   end
 
@@ -31,11 +31,11 @@ class Br < Formula
   on_linux do
     on_arm do
       url "https://github.com/Dicklesworthstone/beads_rust/releases/download/v#{version}/br-#{version}-linux_musl_arm64.tar.gz"
-      sha256 "eab92af18717a43ae05d2facdd25c851cdbd8229969a1570e9d4ea60e4f05f82"  # linux_musl_arm64
+      sha256 "082d02cda1919d6b1587c0a932f5842fa510a7a18d80db0d2a85988959c4ae5b"  # linux_musl_arm64
     end
     on_intel do
       url "https://github.com/Dicklesworthstone/beads_rust/releases/download/v#{version}/br-#{version}-linux_musl_amd64.tar.gz"
-      sha256 "8fe4035f2b981c8686371a4767fece78b87b801baea8eff04d8fe87f8f645a49"  # linux_musl_amd64
+      sha256 "5263fa20f988588b88320856e7a1086505d28a2456628b85cc8f6ec51e0af732"  # linux_musl_amd64
     end
   end
 

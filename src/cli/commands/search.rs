@@ -3,6 +3,7 @@
 //! Classic bd-style substring search across title/description/id — plus
 //! comment bodies (beads_rust#416) — with list-like filters.
 
+use super::list_fields::{FieldSelection, SelectedIssue};
 use crate::cli::{
     DEFAULT_LIST_OFFSET, DEFAULT_SEARCH_LIMIT, ListArgs, OutputFormat, SearchArgs,
     resolve_output_format_with_outer_mode,
@@ -12,14 +13,30 @@ use crate::error::{BeadsError, Result};
 use crate::format::{
     IssueWithCounts, TextFormatOptions, csv, format_issue_line_with, terminal_width,
 };
-use crate::model::{Issue, IssueType, Priority, Status};
+use crate::model::{Issue, IssueType, Status};
 use crate::output::{IssueTable, IssueTableColumns, OutputContext, OutputMode};
 use crate::storage::{ListFilters, SqliteStorage};
 use chrono::Utc;
 use regex::{Regex, RegexBuilder};
 use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
-use std::str::FromStr;
+
+#[cfg(test)]
+use crate::model::Priority;
+#[cfg(test)]
+use crate::storage::unicode_issue_fields_match;
+
+#[cfg(test)]
+#[path = "search/unicode_tests.rs"]
+mod unicode_tests;
+
+#[cfg(test)]
+#[path = "search/field_tests.rs"]
+mod field_tests;
+
+#[cfg(test)]
+#[path = "search/filter_tests.rs"]
+mod filter_tests;
 
 /// Execute the search command.
 ///
@@ -104,6 +121,17 @@ fn collect_search_results_for_output(
     list_args: &ListArgs,
     output_format: OutputFormat,
 ) -> Result<SearchPage> {
+    // Validate once, even for an empty result or quiet output. Text and CSV
+    // keep their existing field behavior. Selection never changes the query.
+    let selection = if matches!(output_format, OutputFormat::Json | OutputFormat::Toon) {
+        list_args
+            .fields
+            .as_deref()
+            .map(FieldSelection::parse)
+            .transpose()?
+    } else {
+        None
+    };
     let limit = list_args.limit.unwrap_or(DEFAULT_SEARCH_LIMIT);
     let offset = list_args.offset.unwrap_or(DEFAULT_LIST_OFFSET);
     let mut probe_args = list_args.clone();
@@ -117,7 +145,10 @@ fn collect_search_results_for_output(
         storage,
         query,
         &probe_args,
-        matches!(output_format, OutputFormat::Text),
+        matches!(output_format, OutputFormat::Text)
+            || selection
+                .as_ref()
+                .is_some_and(FieldSelection::can_use_text_rows),
     )?;
     let has_more = limit > 0 && issues.len() > limit;
     if has_more {
@@ -128,6 +159,7 @@ fn collect_search_results_for_output(
         limit,
         offset,
         has_more,
+        selection,
     })
 }
 
@@ -136,6 +168,7 @@ struct SearchPage {
     limit: usize,
     offset: usize,
     has_more: bool,
+    selection: Option<FieldSelection>,
 }
 
 fn collect_search_results_with_projection(
@@ -146,7 +179,22 @@ fn collect_search_results_with_projection(
 ) -> Result<Vec<Issue>> {
     let mut filters = build_filters(list_args)?;
     let client_filters = needs_client_filters(list_args);
-    let needs_post_query_ordering = requires_post_query_ordering(list_args, client_filters);
+    // SQLite lower() folds ASCII only. Unicode queries must be matched before
+    // applying any page boundary, just like the existing client-side filters.
+    let unicode_query = !query.is_ascii();
+    if unicode_query
+        && !client_filters
+        && !list_args.reverse
+        && matches!(list_args.sort.as_deref(), None | Some("priority"))
+    {
+        // The narrow candidate query already has the final default order.
+        // Apply the matching page (including the caller's look-ahead row)
+        // before hydration, not after loading every full matching record.
+        // Other sorts and client-only filters retain the full-record path.
+        return storage.search_unicode_issues_default_page(query, &filters);
+    }
+    let needs_post_query_ordering =
+        requires_post_query_ordering(list_args, client_filters || unicode_query);
     let (offset, limit) = if needs_post_query_ordering {
         (filters.offset.take(), filters.limit.take())
     } else {
@@ -157,7 +205,9 @@ fn collect_search_results_with_projection(
         filters.reverse = false;
     }
 
-    let issues = if use_text_projection && !client_filters {
+    let issues = if unicode_query {
+        search_unicode_issues(storage, query, &filters)?
+    } else if use_text_projection && !client_filters {
         storage.search_issues_for_command_output(query, &filters)?
     } else {
         storage.search_issues(query, &filters)?
@@ -190,6 +240,15 @@ fn collect_search_results_with_projection(
     Ok(issues)
 }
 
+/// Match before client filtering/pagination, hydrating only matching issues.
+fn search_unicode_issues(
+    storage: &SqliteStorage,
+    query: &str,
+    filters: &ListFilters,
+) -> Result<Vec<Issue>> {
+    storage.search_unicode_issues_unpaginated(query, filters)
+}
+
 #[allow(clippy::too_many_lines)]
 fn render_search_results(
     storage: &SqliteStorage,
@@ -205,6 +264,7 @@ fn render_search_results(
         limit,
         offset,
         has_more,
+        selection,
     } = page;
     let quiet = cli.quiet.unwrap_or(false);
     let early_ctx = OutputContext::from_output_format(output_format, quiet, true);
@@ -221,6 +281,25 @@ fn render_search_results(
     } else {
         count_hidden_closed_matches(storage, query, list_args)?
     };
+
+    if let Some(selection) = selection {
+        // Prepare only requested relations, after filtering and pagination.
+        // Keep search's envelope rather than manufacturing a list total or
+        // losing hidden-history evidence when the visible page is empty.
+        let selected = SelectedSearchResults {
+            issues: selection.rows(storage, issues)?.collect(),
+            hidden_closed_count,
+            limit,
+            offset,
+            has_more,
+        };
+        if matches!(output_format, OutputFormat::Toon) {
+            early_ctx.toon_with_stats(&selected, list_args.stats);
+        } else {
+            early_ctx.json(&selected);
+        }
+        return Ok(());
+    }
 
     match output_format {
         OutputFormat::Json => {
@@ -350,6 +429,16 @@ struct SearchResults<'a> {
     has_more: bool,
 }
 
+/// Same search metadata as full rows; only the issue columns are selected.
+#[derive(serde::Serialize)]
+struct SelectedSearchResults<'a> {
+    issues: Vec<SelectedIssue<'a>>,
+    hidden_closed_count: usize,
+    limit: usize,
+    offset: usize,
+    has_more: bool,
+}
+
 fn emit_search_truncation_note(
     shown: usize,
     limit: usize,
@@ -399,13 +488,19 @@ fn count_hidden_closed_matches(
     filters.offset = None;
     filters.sort = None;
     filters.reverse = false;
-    if needs_client_filters(list_args) {
-        // Client-side filters (id, priority bounds, desc/notes contains)
-        // cannot run in SQL; count by filtering the closed matches the same
-        // way the visible set was filtered.
+    if needs_client_filters(list_args) || !query.is_ascii() {
+        // Client-side filters and Unicode matching must use the same predicate
+        // for hidden history as for the visible result set, before pagination.
         filters.statuses = Some(vec![Status::Closed]);
         filters.include_closed = true;
-        let issues = storage.search_issues(query, &filters)?;
+        if !query.is_ascii() && !needs_client_filters(list_args) {
+            return storage.count_unicode_search_matches_unpaginated(query, &filters);
+        }
+        let issues = if query.is_ascii() {
+            storage.search_issues(query, &filters)?
+        } else {
+            search_unicode_issues(storage, query, &filters)?
+        };
         return Ok(apply_client_filters(issues, list_args)?.len());
     }
     storage.count_closed_search_matches(query, &filters)
@@ -584,14 +679,12 @@ fn build_filters(args: &ListArgs) -> Result<ListFilters> {
         )
     };
 
+    // Search inherits ListArgs, so accept the same ranges, comma lists and
+    // repeated priority selectors as list, ready, blocked and count.
     let priorities = if args.priority.is_empty() {
         None
     } else {
-        let mut parsed = Vec::new();
-        for p in &args.priority {
-            parsed.push(Priority::from_str(p)?);
-        }
-        Some(parsed)
+        Some(crate::validation::parse_priority_filter(&args.priority)?)
     };
 
     let include_closed = args.all
@@ -634,6 +727,11 @@ fn build_filters(args: &ListArgs) -> Result<ListFilters> {
         } else {
             Some(args.label_any.clone())
         },
+        exclude_labels: if args.exclude_label.is_empty() {
+            None
+        } else {
+            Some(args.exclude_label.clone())
+        },
         updated_before: None,
         updated_after: None,
     })
@@ -671,6 +769,20 @@ fn apply_client_filters(
     issues: Vec<crate::model::Issue>,
     args: &ListArgs,
 ) -> Result<Vec<crate::model::Issue>> {
+    apply_client_filters_with_compiler(issues, args, |pattern| {
+        RegexBuilder::new(pattern).case_insensitive(true).build()
+    })
+}
+
+// Inject only the compiler, not the predicate or filter application. Tests can
+// exercise a real resource-limit refusal with a small pattern without forcing
+// the suite to allocate an oversized user query. Production keeps the regex
+// engine's default limits and Unicode case-folding behavior.
+fn apply_client_filters_with_compiler(
+    issues: Vec<crate::model::Issue>,
+    args: &ListArgs,
+    mut compile: impl FnMut(&str) -> std::result::Result<Regex, regex::Error>,
+) -> Result<Vec<crate::model::Issue>> {
     let id_filter: Option<HashSet<&str>> = if args.id.is_empty() {
         None
     } else {
@@ -682,19 +794,22 @@ fn apply_client_filters(
     let min_priority = args.priority_min.map(i32::from);
     let max_priority = args.priority_max.map(i32::from);
 
-    // Use Regex for efficient case-insensitive search without full description allocations
-    let desc_regex = args.desc_contains.as_deref().and_then(|needle| {
-        RegexBuilder::new(&regex::escape(needle))
-            .case_insensitive(true)
-            .build()
-            .ok()
-    });
-    let notes_regex = args.notes_contains.as_deref().and_then(|needle| {
-        RegexBuilder::new(&regex::escape(needle))
-            .case_insensitive(true)
-            .build()
-            .ok()
-    });
+    // A supplied predicate is mandatory. Converting a compiler error to None
+    // would silently widen the result set, including hidden-history counts.
+    // Compile even when issues is empty so an invalid filter cannot masquerade
+    // as a successful zero-result query. Preserve literal (not regex) syntax.
+    let mut text_filter = |field: &str, value: Option<&str>| -> Result<Option<Regex>> {
+        value
+            .map(|needle| {
+                compile(&regex::escape(needle)).map_err(|error| BeadsError::Validation {
+                    field: field.to_string(),
+                    reason: format!("cannot compile case-insensitive literal filter: {error}"),
+                })
+            })
+            .transpose()
+    };
+    let desc_regex = text_filter("desc_contains", args.desc_contains.as_deref())?;
+    let notes_regex = text_filter("notes_contains", args.notes_contains.as_deref())?;
 
     // Deferred issues are included by default when no status filter is specified,
     // except `--overdue` keeps deferred work hidden unless requested.

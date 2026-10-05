@@ -201,7 +201,9 @@ Every command supports `--json` for AI coding agents:
 
 ```bash
 br list --json | jq '.issues[] | select(.priority <= 1)'
-br ready --json  # Structured output for agents
+br ready --json          # Structured output for agents
+br ready --brief --json  # Same rows, without the long free-text fields
+br list --json --fields id,title,status,priority   # Same rows, only these keys
 br show br-abc123 --json
 br capabilities --format json
 br capabilities --format json --command "create"
@@ -272,18 +274,19 @@ Agent Mail, MCP clients, or fixture update modes.
 | Storage | SQLite + JSONL | Dolt/SQLite |
 | Background daemon | **No** | Yes |
 | Hook installation | **Manual** | Automatic |
-| Binary size | ~26 MiB stripped executable, ~11 MiB compressed (v0.5.11, x86_64 Linux GNU; dynamically linked) | ~30+ MB |
+| Binary size | ~26 MiB stripped executable, ~11 MiB compressed (v0.6.0, x86_64 Linux GNU; dynamically linked) | ~30+ MB |
 | Scope | Local CLI, sync, recovery, and agent workflows | Feature-rich ecosystem |
 
 **When to use br:** You want a stable, local-first issue tracker with explicit sync, dependency-aware planning, and machine-readable output.
 
 **When to use beads:** You want advanced features like Linear/Jira sync, RPC daemon, automatic hooks.
 
-Linux releases include GNU and musl targets. The v0.5.11 x86_64 GNU executable
-is 27,673,760 bytes and its archive is 11,735,518 bytes; the musl executable is
-26,579,176 bytes and its archive is 11,691,141 bytes. The musl executable is
+Linux releases include GNU and musl targets. The v0.6.0 x86_64 GNU executable
+is 27,772,512 bytes and its archive is 11,732,979 bytes; the musl executable is
+26,657,512 bytes and its archive is 11,684,734 bytes. The musl executable is
 statically linked; the GNU executable needs the system's glibc loader. Sizes
-vary with the target, version, and enabled features.
+vary with the target, version, and enabled features. These figures were read
+from the published v0.6.0 archives, whose `.sha256` sidecars both verified.
 
 ### br vs GitHub Issues
 
@@ -435,7 +438,7 @@ The resource surface is `beads://project/info`, `beads://issue/{id}`,
 
 ```bash
 br --version
-# br 0.6.0
+# br 0.7.4
 ```
 
 ### Verify Release Signatures
@@ -545,7 +548,9 @@ git commit -m "Fix: login timeout (br-a1b2c3)"
 |---------|-------------|---------|
 | `list` | List issues | `br list --status open --priority 0-1` |
 | `list --tree` | Group children under their parents with tree connectors | `br list --tree` |
+| `list --fields` | Select which keys appear in each JSON/TOON row (columns only, never rows) | `br list --json --fields id,title,priority` |
 | `ready` | Actionable work | `br ready` |
+| `ready --brief` | Actionable work without long free-text fields (for agents selecting work) | `br ready --brief --json` |
 | `blocked` | Blocked issues | `br blocked --json \| jq '.issues[]'` |
 | `search` | Full-text search | `br search "authentication"` |
 | `stale` | Stale issues | `br stale --days 30` |
@@ -1138,9 +1143,17 @@ protected backup, so retain it until recovery is verified.
 
 ### Reconcile portable source repository paths
 
-To reconcile valid rows from both stores while replacing stale
-machine-specific `source_repo_path` values with the canonical current workspace
-path, review and apply an exact hash-bound plan:
+`source_repo_path` is machine-local: the database keeps the absolute
+workspace path for local tooling (`br show --json`, `br list --json`), but
+`issues.jsonl` never carries it, so the committed file does not leak local
+paths or churn between machines. Older JSONL rows that still carry a path
+import normally and lose the field when they are next written; such a legacy
+path only fills a row that has none and never replaces this machine's own
+path.
+
+To reconcile valid rows from both stores, set every row's local
+`source_repo_path` to the canonical current workspace path, and strip legacy
+paths from the JSONL in one step, review and apply an exact hash-bound plan:
 
 ```bash
 plan="$(br sync --migrate-source-repo-path --robot)"
@@ -1174,6 +1187,44 @@ br doctor
 same issue changed on both sides, br stops and asks for an explicit policy:
 `--force-db` keeps the local SQLite version, `--force-jsonl` keeps the JSONL
 version, and `--force` keeps the newer timestamp.
+
+Comments are append-only, so the merge keeps every comment either side added.
+Two clones can also mint the same id for different issues (child ids such as
+`<parent>.1` come from each database's own counter). The merge treats a
+different `created_at` as a different issue: the earlier one keeps the id, the
+other is renumbered (for example to `<parent>.2`) with its relations, and br
+prints an `ID collision` warning (`id_collisions` in `--json`). `br sync
+--import-only` refuses a JSONL that would drop a local issue this way and
+points at `br sync --merge`.
+
+### Error: "database is busy (recovery in progress)"
+
+**Cause:** the WAL index (`.beads/beads.db-shm`) has to be rebuilt before the
+engine will read the database. Stock SQLite programs that open the tracker
+(bv, the `sqlite3` shell, Python) and br 0.6.0 leave indexes like that; for
+those, read-only commands (`--no-auto-import --no-auto-flush`, which is what bv
+runs) read a private snapshot and any ordinary command rebuilds the index, so
+you should not see this error. You see it when the index is damaged in some
+other way (a torn header, a truncated or overwritten file), which every command
+refuses, or while another br process is recovering the database.
+
+```bash
+# Rebuild the index; the main database, WAL and issue data are not changed
+br doctor migrate-schema recover
+
+# Diagnose
+br doctor
+```
+
+Each rebuild keeps its pre-recovery state under
+`.beads/.br_recovery/schema-migrations/<run>/recovery-before/`. When the WAL
+holds no frames (the usual state after a SQLite reader), only the old index is
+kept, because the main database file already holds every row and is not
+changed. Otherwise the complete database family is kept. br removes completed
+recovery runs automatically once they are both outside the five newest for
+that database and older than seven days. Failed or interrupted recovery runs,
+and schema-migration runs (which `br doctor migrate-schema undo` needs), are
+never removed automatically.
 
 ### Command Output is Garbled
 
